@@ -84,6 +84,62 @@ self_energy(M::SchurModel, z::Number) = M.B * ((M.D - z * I) \ Matrix(M.B'))
 
 
 
+===== FILE: src\reduction\adaptive_poles.jl =====
+
+"""
+    greedy_rational_shifts(M, ωgrid, η, b; s_max=12, rtol=1e-10, init_shifts=ComplexF64[im * η])
+
+Greedily select rational Krylov shifts for the self-energy action on `b`.
+Starting from `init_shifts`, repeatedly build a basis from `M.D` and `M.B'`,
+then add the shift `ω + im*η` at the grid point with largest relative error
+`norm((Σ(z) - Σₖ(z)) * b) / norm(Σ(z) * b)`, where `z = ω + im*η`,
+`Σ(z) = self_energy(M, z)`, and `Σₖ(z) = reduced_self_energy(RM, z)`.
+The process stops when the maximum error is below `1e-8` or after `s_max`
+shifts have been added. Repeated candidate shifts are slightly perturbed.
+
+Returns the selected shifts and a vector of per-iteration named tuples with
+`max_err` and basis dimension `k`.
+"""
+function greedy_rational_shifts(M::SchurModel, ωgrid, η::Real, b;
+                                s_max::Integer = 12, rtol::Real = 1e-10,
+                                init_shifts = ComplexF64[im * η])
+    s_max >= 0 || throw(ArgumentError("s_max must be nonnegative"))
+    frequencies = collect(ωgrid)
+    isempty(frequencies) && throw(ArgumentError("ωgrid must not be empty"))
+
+    shifts = ComplexF64.(collect(init_shifts))
+    history = NamedTuple[]
+    for added in 0:s_max
+        Q = rational_krylov_basis(M.D, M.B', shifts; rtol = rtol)
+        RM = ReducedSchurModel(M, Q)
+        errors = Float64[]
+        for ω in frequencies
+            z = ω + im * η
+            exact = self_energy(M, z) * b
+            approx = reduced_self_energy(RM, z) * b
+            denominator = norm(exact)
+            err = denominator == 0 ? (norm(exact - approx) == 0 ? 0.0 : Inf) :
+                                     norm(exact - approx) / denominator
+            push!(errors, err)
+        end
+
+        max_err, worst = findmax(errors)
+        push!(history, (max_err = max_err, k = size(Q, 2)))
+        (max_err < 1e-8 || added == s_max) && break
+
+        candidate = ComplexF64(frequencies[worst] + im * η)
+        while any(abs(candidate - σ) <= 100eps(Float64) * max(1.0, abs(candidate), abs(σ))
+                  for σ in shifts)
+            candidate += sqrt(eps(Float64)) * max(1.0, abs(candidate))
+        end
+        push!(shifts, candidate)
+    end
+    return shifts, history
+end
+
+
+
+
 ===== FILE: src\reduction\diagnostics.jl =====
 
 """
@@ -316,13 +372,14 @@ export SchurModel, self_energy, apply_self_energy, apply_schur, schur_matrix,
 export rational_krylov_basis, polynomial_krylov_basis, ReducedSchurModel,
        reduced_self_energy, apply_reduced_self_energy, reduced_schur_matrix,
        solve_reduced_schur, reduced_auxiliary_matrix, solve_full_reduced_upper,
-       rational_compression_diagnostics, print_diagnostics
+       rational_compression_diagnostics, print_diagnostics, greedy_rational_shifts
 
 include("operators/schur_self_energy.jl")
 include("operators/schur_operator.jl")
 include("operators/auxiliary_operator.jl")
 include("reduction/rational_krylov.jl")
 include("reduction/projection.jl")
+include("reduction/adaptive_poles.jl")
 include("reduction/diagnostics.jl")
 
 end
@@ -336,6 +393,27 @@ using Test
 using ShiftSchur
 include("test_schur_identity.jl")
 include("test_rational_reduction.jl")
+include("test_adaptive.jl")
+
+
+
+
+===== FILE: test\test_adaptive.jl =====
+
+@testset "greedy adaptive rational shifts" begin
+    M, b = synthetic_rational_model()
+    ωgrid = range(-1.0, 1.0; length = 41)
+    η = 0.1
+    shifts, hist = greedy_rational_shifts(M, ωgrid, η, b; s_max = 8,
+                                          init_shifts = ComplexF64[0.0 + im * η])
+
+    @test length(shifts) <= 9
+    @test length(unique(shifts)) == length(shifts)
+    @test length(hist) >= 2
+    @test all(hist[i].k <= hist[i + 1].k for i in 1:(length(hist) - 1))
+    @test hist[end].max_err < hist[1].max_err / 100
+    @test hist[end].max_err < 1e-4
+end
 
 
 
