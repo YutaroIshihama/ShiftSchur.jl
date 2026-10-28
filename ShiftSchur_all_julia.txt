@@ -1,0 +1,144 @@
+===== FILE: src\operators\auxiliary_operator.jl =====
+
+"""
+    auxiliary_matrix(M)
+
+Frequency-independent enlarged matrix [A B; B† D]; (auxiliary_matrix(M) - zI)
+is the full (unreduced) enlarged system whose Schur complement is S(z).
+"""
+auxiliary_matrix(M::SchurModel) = [Matrix(M.A) Matrix(M.B); Matrix(M.B') Matrix(M.D)]
+
+"""
+    solve_full_upper(M, z, b)
+
+Upper block x of the solution of
+`[A-zI B; B† D-zI] [x; y] = [b; 0]`.
+"""
+function solve_full_upper(M::SchurModel, z::Number, b)
+    n = size(M.A, 1)
+    H = auxiliary_matrix(M)
+    rhs = [b; zeros(eltype(H), size(M.D, 1), size(b)[2:end]...)]
+    sol = (H - z * I) \ rhs
+    sol[1:n, ntuple(_ -> :, ndims(b) - 1)...]
+end
+
+
+
+
+===== FILE: src\operators\schur_operator.jl =====
+
+"""
+    apply_schur(M, z, v)
+
+S(z) v = (A - zI) v - Σ(z) v, with Σ(z) = B (D - zI)⁻¹ B†.
+"""
+apply_schur(M::SchurModel, z::Number, v) =
+    M.A * v - z * v - apply_self_energy(M, z, v)
+
+"""
+    schur_matrix(M, z)
+
+Dense S(z) = A - zI - B (D - zI)⁻¹ B†.
+"""
+schur_matrix(M::SchurModel, z::Number) = Matrix(M.A) - z * I - self_energy(M, z)
+
+"""
+    solve_schur(M, z, b)
+
+Direct solve of S(z) x = b (exact Schur system, no approximation).
+"""
+solve_schur(M::SchurModel, z::Number, b) = schur_matrix(M, z) \ b
+
+
+
+
+===== FILE: src\operators\schur_self_energy.jl =====
+
+"""
+    SchurModel(A, D, B)
+
+Hermitian `A` (n×n, retained space), Hermitian `D` (m×m, eliminated space)
+and coupling `B` (n×m). Convention: `z = ω + iη`, shifts enter as `X - zI`.
+"""
+struct SchurModel{TA,TD,TB}
+    A::TA
+    D::TD
+    B::TB
+end
+
+"""
+    apply_self_energy(M, z, v)
+
+Σ(z) v = B (D - zI)⁻¹ B† v  (matrix-compatible; one D-solve per call).
+"""
+apply_self_energy(M::SchurModel, z::Number, v) =
+    M.B * ((M.D - z * I) \ (M.B' * v))
+
+"""
+    self_energy(M, z)
+
+Dense Σ(z) = B (D - zI)⁻¹ B†.
+"""
+self_energy(M::SchurModel, z::Number) = M.B * ((M.D - z * I) \ Matrix(M.B'))
+
+
+
+
+===== FILE: src\ShiftSchur.jl =====
+
+module ShiftSchur
+
+using LinearAlgebra
+
+export SchurModel, self_energy, apply_self_energy, apply_schur, schur_matrix,
+       solve_schur, auxiliary_matrix, solve_full_upper
+
+include("operators/schur_self_energy.jl")
+include("operators/schur_operator.jl")
+include("operators/auxiliary_operator.jl")
+
+end
+
+
+
+
+===== FILE: test\runtests.jl =====
+
+using Test
+using ShiftSchur
+include("test_schur_identity.jl")
+
+
+
+
+===== FILE: test\test_schur_identity.jl =====
+
+using LinearAlgebra, Random
+
+@testset "Schur identity (random Hermitian)" begin
+    rng = MersenneTwister(1234)
+    n, m = 6, 14
+    hermitian(k) = (X = randn(rng, ComplexF64, k, k); (X + X') / 2)
+    A, D = hermitian(n), hermitian(m)
+    B = randn(rng, ComplexF64, n, m) / 4
+    b = randn(rng, ComplexF64, n)
+    M = SchurModel(A, D, B)
+    H = auxiliary_matrix(M)
+    @test ishermitian(H)
+    for z in (0.3 + 1e-2im, -1.5 + 0.1im, 2.0 + 1.0im, 40.0 + 0.5im, 0.0 + 1.0im)
+        x = solve_schur(M, z, b)
+        xf = solve_full_upper(M, z, b)
+        @test norm(x - xf) / norm(x) < 1e-11
+        @test norm(apply_schur(M, z, x) - b) / norm(b) < 1e-11
+        v = randn(rng, ComplexF64, n)
+        @test apply_schur(M, z, v) ≈ schur_matrix(M, z) * v
+        @test apply_self_energy(M, z, v) ≈ self_energy(M, z) * v
+    end
+    # real z outside the spectrum
+    zr = maximum(eigvals(Hermitian(H))) + 1.0
+    @test norm(solve_schur(M, zr, b) - solve_full_upper(M, zr, b)) < 1e-11 * norm(solve_schur(M, zr, b))
+end
+
+
+
+
