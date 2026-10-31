@@ -453,6 +453,104 @@ linear_operator_adapter(M::AbstractMatrix) = LinearMap(M)
 
 
 
+===== FILE: src\dftk\si_response_adapter.jl =====
+
+module ShiftSchurDFTKSiResponse
+using LinearAlgebra
+using ShiftSchur
+export DFTKResponseNotImplemented, SiResponseProblem, build_si_response_problem, validate_response_problem
+struct DFTKResponseNotImplemented <: Exception
+    msg::String
+end
+Base.showerror(io::IO,e::DFTKResponseNotImplemented)=print(io,e.msg)
+struct SiResponseProblem{TM,TV}
+    model::TM
+    probe::TV
+    metadata::NamedTuple
+end
+function validate_response_problem(p::SiResponseProblem)
+    M=p.model; b=p.probe
+    n=size(M.A,1); m=size(M.D,1)
+    size(M.A)==(n,n) || throw(DimensionMismatch("A must be square"))
+    size(M.D)==(m,m) || throw(DimensionMismatch("D must be square"))
+    size(M.B)==(n,m) || throw(DimensionMismatch("B must be n x m"))
+    length(b)==n || throw(DimensionMismatch("probe length must equal size(A,1)"))
+    ishermitian(Matrix(M.A)) || error("A is not Hermitian")
+    ishermitian(Matrix(M.D)) || error("D is not Hermitian")
+    return true
+end
+function build_si_response_problem(payload; q=(0.0,0.0,0.0), perturbation=:density_head)
+    throw(DFTKResponseNotImplemented("The real DFTK silicon SCF succeeded, but the physical response adapter is not connected yet. Implement this function from the installed DFTK linear-response/Sternheimer API. It must construct physical A, B, D and probe b; do not substitute a KS occupied/virtual block partition as a surrogate."))
+end
+end
+
+
+
+
+===== FILE: src\dftk\si_scf.jl =====
+
+module ShiftSchurDFTKSiSCF
+
+using LinearAlgebra
+using DFTK
+using PseudoPotentialData
+
+export SiSCFConfig, run_si_scf, scf_payload
+
+Base.@kwdef struct SiSCFConfig
+    lattice_constant_bohr::Float64 = 10.26
+    Ecut::Float64 = 15.0
+    kgrid::NTuple{3,Int} = (2, 2, 2)
+    tol::Float64 = 1e-6
+end
+
+function run_si_scf(cfg::SiSCFConfig=SiSCFConfig())
+    a = cfg.lattice_constant_bohr
+    lattice = a / 2 .* [0 1 1; 1 0 1; 1 1 0]
+
+    pd_family = PseudoFamily("dojo.nc.sr.lda.v0_4_1.standard.upf")
+    Si = ElementPsp(:Si, pd_family)
+
+    atoms = [Si, Si]
+    positions = [[0.0, 0.0, 0.0], [0.25, 0.25, 0.25]]
+
+    model = model_DFT(
+        lattice,
+        atoms,
+        positions;
+        functionals=LDA(),
+        temperature=0.01,
+        smearing=Smearing.Gaussian(),
+    )
+
+    basis = PlaneWaveBasis(
+        model;
+        Ecut=cfg.Ecut,
+        kgrid=collect(cfg.kgrid),
+    )
+
+    scfres = self_consistent_field(basis; tol=cfg.tol)
+
+    return scfres
+end
+
+function scf_payload(scfres)
+    return (
+        basis=scfres.basis,
+        psi=scfres.ψ,
+        eigenvalues=scfres.eigenvalues,
+        occupation=hasproperty(scfres, :occupation) ? scfres.occupation : nothing,
+        rho=hasproperty(scfres, :ρ) ? scfres.ρ : nothing,
+        epsilon_F=hasproperty(scfres, :εF) ? scfres.εF : nothing,
+        raw=scfres,
+    )
+end
+
+end
+
+
+
+
 ===== FILE: src\dielectric\dielectric.jl =====
 
 """
@@ -634,16 +732,50 @@ function greedy_rational_shifts_aposteriori(M::SchurModel, ωgrid, η::Real, b;
     for added in 0:s_max
         errors = ErrorEstimators.residual_norms_grid(RM, DQ, frequencies, η, b, M.B)
         max_err, worst = findmax(errors)
-        push!(history, (max_err = max_err, k = size(Q, 2), est_type = estimator))
-        (max_err <= tol || added == s_max) && break
-
-        candidate = ComplexF64(frequencies[worst] + im * η)
-        while any(abs(candidate - σ) <= 100eps(Float64) * max(1.0, abs(candidate), abs(σ))
-                  for σ in shifts)
-            candidate += sqrt(eps(Float64)) * max(1.0, abs(candidate))
+        if max_err <= tol || added == s_max
+            push!(history, (max_err = max_err, k = size(Q, 2),
+                            est_type = estimator, n_poles = length(shifts),
+                            max_omega = frequencies[worst], selected_omega = nothing,
+                            shifts = copy(shifts)))
+            @info("adaptive pole iteration", added=added, max_err=max_err,
+                  n_poles=length(shifts), max_omega=frequencies[worst],
+                  selected_omega=nothing, basis_dimension=size(Q, 2),
+                  shifts=copy(shifts))
+            break
         end
-        push!(shifts, candidate)
 
+        candidate = nothing
+        for idx in sortperm(errors; rev = true)
+            pole = ComplexF64(frequencies[idx] + im * η)
+            if all(abs(pole - σ) > 100eps(Float64) * max(1.0, abs(pole), abs(σ))
+                   for σ in shifts)
+                candidate = pole
+                break
+            end
+        end
+        if candidate === nothing
+            push!(history, (max_err = max_err, k = size(Q, 2),
+                            est_type = estimator, n_poles = length(shifts),
+                            max_omega = frequencies[worst], selected_omega = nothing,
+                            shifts = copy(shifts)))
+            @info("adaptive pole iteration", added=added, max_err=max_err,
+                  n_poles=length(shifts), max_omega=frequencies[worst],
+                  selected_omega=nothing, basis_dimension=size(Q, 2),
+                  shifts=copy(shifts))
+            break
+        end
+
+        selected_omega = real(candidate)
+        push!(history, (max_err = max_err, k = size(Q, 2),
+                        est_type = estimator, n_poles = length(shifts),
+                        max_omega = frequencies[worst],
+                        selected_omega = selected_omega, shifts = copy(shifts)))
+        @info("adaptive pole iteration", added=added, max_err=max_err, n_poles=length(shifts),
+              max_omega=frequencies[worst],
+              selected_omega=selected_omega, basis_dimension=size(Q, 2),
+              shifts=copy(shifts))
+
+        push!(shifts, candidate)
         Qnew = rational_krylov_basis(M.D, M.B', shifts; rtol = rtol)
         DQ = ErrorEstimators.expand_DQ(M.D, Q, DQ, Qnew)
         Q = Qnew
@@ -1084,6 +1216,75 @@ end
 
 
 
+===== FILE: test\diagnose_adaptive_convergence.jl =====
+
+using LinearAlgebra, Random, ShiftSchur
+
+function _diagnostic_synthetic_model(; m=150, n=3, seed=20240601)
+    rng = MersenneTwister(seed)
+    nb = m - 4
+    bulk = [range(-3.0, -1.3; length=nb ÷ 2);
+            range(1.3, 3.0; length=nb - nb ÷ 2)]
+    λ = sort([bulk; -0.6; -0.1; 0.35; 0.8])
+    U = Matrix(qr(randn(rng, ComplexF64, m, m)).Q)
+    D = U * Diagonal(λ) * U'
+    D = (D + D') / 2
+    A0 = randn(rng, ComplexF64, n, n)
+    A = (A0 + A0') / 2
+    w = [abs(x) < 1.1 ? 0.5 : 3 / sqrt(m) for x in λ]
+    B = randn(rng, ComplexF64, n, m) * Diagonal(w) * U'
+    b = randn(rng, ComplexF64, n)
+    return SchurModel(A, D, B), b
+end
+
+function _diagnostic_true_max_error(M, shifts, ωgrid, η, b)
+    Q = rational_krylov_basis(M.D, M.B', shifts)
+    RM = ReducedSchurModel(M, Q)
+    return maximum(ωgrid) do ω
+        z = ω + im * η
+        exact = apply_self_energy(M, z, b)
+        approx = apply_reduced_self_energy(RM, z, b)
+        denom = norm(exact)
+        denom == 0 ? (norm(exact - approx) == 0 ? 0.0 : Inf) :
+                     norm(exact - approx) / denom
+    end
+end
+
+function run_adaptive_convergence_diagnostic()
+    M, b = _diagnostic_synthetic_model()
+    ωgrid = range(-1.0, 1.0; length=41)
+    η = 0.1
+    init_shifts = ComplexF64[0.0 + im * η]
+    results = NamedTuple[]
+
+    for max_poles in (16, 20)
+        println("\n=== Adaptive convergence diagnostic: max_poles=$max_poles, tol=1e-4 ===")
+        _, history = greedy_rational_shifts_aposteriori(
+            M, ωgrid, η, b; s_max=max_poles - length(init_shifts),
+            init_shifts=init_shifts, tol=1e-4)
+
+        println("npoles | basis_dim | max_estimator | max_true_error | max_omega | selected_omega")
+        for step in history
+            true_error = _diagnostic_true_max_error(M, step.shifts, ωgrid, η, b)
+            selected = step.selected_omega === nothing ? "none" : string(step.selected_omega)
+            println(join((step.n_poles, step.k, round(step.max_err; sigdigits=8),
+                          round(true_error; sigdigits=8), step.max_omega, selected), " | "))
+            push!(results, (max_poles=max_poles, n_poles=step.n_poles,
+                            basis_dim=step.k, max_estimator=step.max_err,
+                            max_true_error=true_error, max_omega=step.max_omega,
+                            selected_omega=step.selected_omega, shifts=step.shifts))
+        end
+    end
+    return results
+end
+
+if abspath(PROGRAM_FILE) == abspath(@__FILE__)
+    run_adaptive_convergence_diagnostic()
+end
+
+
+
+
 ===== FILE: test\runtests.jl =====
 
 using Test
@@ -1092,6 +1293,13 @@ include("test_schur_identity.jl")
 include("test_rational_reduction.jl")
 include("test_dielectric.jl")
 include("test_adaptive.jl")
+include("diagnose_adaptive_convergence.jl")
+@testset "Adaptive convergence diagnostics" begin
+    results = run_adaptive_convergence_diagnostic()
+    @test !isempty(results)
+    @test all(row.max_true_error >= 0 for row in results)
+    @test all(row.max_estimator >= 0 for row in results)
+end
 
 
 
@@ -1102,15 +1310,42 @@ include("test_adaptive.jl")
     M, b = synthetic_rational_model()
     ωgrid = range(-1.0, 1.0; length = 41)
     η = 0.1
-    shifts, hist = greedy_rational_shifts(M, ωgrid, η, b; s_max = 8,
-                                          init_shifts = ComplexF64[0.0 + im * η])
+    shifts, hist = greedy_rational_shifts_aposteriori(
+        M, ωgrid, η, b; s_max = 15, tol = 1e-4,
+        init_shifts = ComplexF64[0.0 + im * η])
+    Q = rational_krylov_basis(M.D, M.B', shifts)
+    RM = ReducedSchurModel(M, Q)
+    max_true_error = maximum(ωgrid) do ω
+        z = ω + im * η
+        exact = apply_self_energy(M, z, b)
+        approx = apply_reduced_self_energy(RM, z, b)
+        norm(exact - approx) / norm(exact)
+    end
 
-    @test length(shifts) <= 9
+    @test length(shifts) <= 16
     @test length(unique(shifts)) == length(shifts)
     @test length(hist) >= 2
     @test all(hist[i].k <= hist[i + 1].k for i in 1:(length(hist) - 1))
     @test hist[end].max_err < hist[1].max_err / 100
     @test hist[end].max_err < 1e-4
+    @test max_true_error < 1e-6
+end
+
+
+
+
+===== FILE: test\test_dftk_si_adapter.jl =====
+
+using Test, LinearAlgebra, ShiftSchur
+include(joinpath(@__DIR__,"..","src","dftk","si_response_adapter.jl"))
+using .ShiftSchurDFTKSiResponse
+@testset "DFTK Si response adapter validation" begin
+    A=Hermitian([1.0 0.1;0.1 2.0])|>Matrix
+    D=Hermitian([3.0 0.2;0.2 4.0])|>Matrix
+    B=[0.2 0.1;0.3 0.2]
+    p=SiResponseProblem(SchurModel(A,D,B),ComplexF64[1,0],(source=:unit_test,))
+    @test validate_response_problem(p)
+    @test_throws DFTKResponseNotImplemented build_si_response_problem(nothing)
 end
 
 

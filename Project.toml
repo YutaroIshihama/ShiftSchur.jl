@@ -1,14 +1,18 @@
 name = "ShiftSchur"
 uuid = "6c1f2f0e-5b0a-4c55-9d0e-3a7d1f6b8e21"
-authors = ["YutaroIshihama"]
 version = "0.1.0"
+authors = ["YutaroIshihama"]
 
 [deps]
-LinearMaps = "7a12625a-238d-50fd-b39a-03d52299707e"
+DFTK = "acf6eb54-70d9-11e9-0013-234b7a5f5337"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+LinearMaps = "7a12625a-238d-50fd-b39a-03d52299707e"
+PseudoPotentialData = "5751a51d-ac76-4487-a056-413ecf6fbe19"
 
 [compat]
+DFTK = "0.8.1"
 LinearMaps = "3"
+PseudoPotentialData = "0.3.2"
 julia = "1.6"
 
 [extras]
