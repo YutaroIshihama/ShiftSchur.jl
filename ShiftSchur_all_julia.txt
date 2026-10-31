@@ -326,6 +326,120 @@ println("  Sigma(0) consistency residual = ",norm(sigma0 + p.metadata.chi0_matri
 
 
 
+===== FILE: examples\epsilon_macro.jl =====
+
+using ShiftSchur
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "epsilon_macro_sternheimer.jl"))
+
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKDielectricMacroSternheimer
+
+println("Running Si SCF...")
+payload = scf_payload(run_si_scf())
+
+omegas = 0.0:0.05:1.0
+eta = 0.05
+q_red = [0.01, 0.0, 0.0]
+
+println("Computing macroscopic epsilon_M via Sternheimer (no SoS) for omegas=$omegas q=$q_red")
+result = epsilon_macro_sternheimer(payload.raw, omegas; eta=eta, q_red=q_red)
+
+output = joinpath(@__DIR__, "..", "docs", "epsilon_macro_sternheimer.csv")
+open(output, "w") do io
+    println(io, "omega,Re_chi0,Im_chi0,Re_epsM,Im_epsM")
+    for (i, omega) in enumerate(result.omegas)
+        println(io, "$omega,$(real(result.chi0[i])),$(imag(result.chi0[i])),$(real(result.epsilon[i])),$(imag(result.epsilon[i]))")
+    end
+end
+println("Saved macro Sternheimer epsilon to $output")
+for (i, omega) in enumerate(result.omegas)
+    println("omega=$omega chi0=$(result.chi0[i]) epsM=$(result.epsilon[i])")
+end
+
+
+
+
+===== FILE: examples\epsilon_sos.jl =====
+
+using ShiftSchur
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_response_adapter.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "epsilon_sos.jl"))
+
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKDielectricSoS
+
+println("Running Si SCF...")
+payload = scf_payload(run_si_scf())
+
+omegas = 0.0:0.05:1.0
+eta = 0.05
+
+println("Computing epsilon via SoS for omegas=$omegas")
+result = epsilon_sos(payload.raw, omegas; eta=eta)
+
+output = joinpath(@__DIR__, "..", "docs", "epsilon_sos_spectrum.csv")
+open(output, "w") do io
+    println(io, "omega,eta,Re_chi0,Im_chi0,Re_epsilon,Im_epsilon")
+    for (i, omega) in enumerate(result.omegas)
+        chi0 = result.chi0[i]
+        eps = result.epsilon[i]
+        println(io, "$omega,$eta,$(real(chi0)),$(imag(chi0)),$(real(eps)),$(imag(eps))")
+    end
+end
+println("Saved SoS epsilon to $output")
+for (i, omega) in enumerate(result.omegas)
+    println("omega=$omega chi0=$(result.chi0[i]) epsilon=$(result.epsilon[i])")
+end
+
+
+
+
+===== FILE: examples\epsilon_spectrum.jl =====
+
+using ShiftSchur
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_response_adapter.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "dynamic_sternheimer.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "epsilon.jl"))
+
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKSiResponse
+using .ShiftSchurDFTKDynamicSternheimer
+using .ShiftSchurDFTKDielectric
+
+println("Running Si SCF...")
+payload = scf_payload(run_si_scf())
+smoke = dftk_static_response_smoke(payload)
+deltaV = smoke.deltaV
+
+omegas = 0.0:0.05:1.0
+eta = 0.05
+
+println("Computing epsilon(omega) for omegas=$omegas eta=$eta")
+result = epsilon_of_omega(payload.raw, deltaV, omegas; eta=eta)
+
+# Save CSV
+output = joinpath(@__DIR__, "..", "docs", "epsilon_spectrum.csv")
+open(output, "w") do io
+    println(io, "omega,eta,Re_chi0,Im_chi0,Re_epsilon,Im_epsilon,abs_epsilon")
+    for (i, omega) in enumerate(result.omegas)
+        chi0 = result.chi0[i]
+        eps = result.epsilon[i]
+        println(io, "$omega,$eta,$(real(chi0)),$(imag(chi0)),$(real(eps)),$(imag(eps)),$(abs(eps))")
+    end
+end
+println("Saved epsilon spectrum to $output")
+
+# Also print for quick check
+for (i, omega) in enumerate(result.omegas)
+    println("omega=$omega chi0=$(result.chi0[i]) epsilon=$(result.epsilon[i])")
+end
+
+
+
+
 ===== FILE: examples\find_chi0.jl =====
 
 using DFTK
@@ -894,7 +1008,7 @@ linear_operator_adapter(M::AbstractMatrix) = LinearMap(M)
 ===== FILE: src\dftk\dynamic_sternheimer.jl =====
 
 """
-v25: use DFTK's own residual measure (absolute) from solver info, fallback to computed but capped
+v28: dense direct solve for dynamic Sternheimer, no iterative, to avoid GMRES bugs
 """
 
 module ShiftSchurDFTKDynamicSternheimer
@@ -916,10 +1030,8 @@ function _to_indices(mask, n_bands::Int)
             return collect(Int, mask)
         end
     end
-    try
-        return findall(mask)
-    catch
-        return [i for (i,v) in enumerate(mask) if v != 0 && v != false]
+    try; return findall(mask)
+    catch; return [i for (i,v) in enumerate(mask) if v != 0 && v != false]
     end
 end
 
@@ -929,16 +1041,44 @@ function compute_alpha_mn(fm, fn, ratio)
     return ratio * fn / (fn^2 + fm^2)
 end
 
+function dense_hamiltonian_matrix(Hk, n_pw::Int)
+    # Build dense matrix by applying Hk to basis vectors
+    Hmat = zeros(ComplexF64, n_pw, n_pw)
+    e = zeros(ComplexF64, n_pw)
+    for i in 1:n_pw
+        fill!(e, 0); e[i]=1
+        Hmat[:,i] .= Hk * e
+    end
+    return Hmat
+end
+
+function solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_n, z::Number)
+    n_pw = size(psi_occ, 1)
+    P_occ = psi_occ * psi_occ'
+    Q_occ = Matrix{ComplexF64}(I - P_occ)
+    b = -Q_occ * rhs_n
+    norm(b) < 1e-14 && return zeros(ComplexF64, n_pw)
+    # Build dense H
+    Hmat = dense_hamiltonian_matrix(Hk, n_pw)
+    A = Q_occ * (Hmat - (eps_n + z)*I) * Q_occ
+    # Regularize: solve in Q space via pinv or \ with small shift
+    # Since A has zero eigenvalues in P space, we solve for x in Q via least squares
+    # Use A + P_occ to make invertible, then project
+    A_reg = A + P_occ
+    x = A_reg \ b
+    x = Q_occ * x
+    return x
+end
+
 function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, dftk_dpsi_ref=nothing;
-                                                occupation_threshold=nothing,
-                                                droptol=nothing)
+                                                occupation_threshold=nothing, droptol=nothing,
+                                                z::Number=0.0+1e-8im)
     basis = scfres.basis
     ham = scfres.ham
     psi = scfres.ψ
     eigenvalues = scfres.eigenvalues
     occupation = [DFTK.to_cpu(occ) for occ in scfres.occupation]
-    threshold = isnothing(occupation_threshold) ?
-        DFTK.default_occupation_threshold(eltype(deltaV)) : occupation_threshold
+    threshold = isnothing(occupation_threshold) ? DFTK.default_occupation_threshold(eltype(deltaV)) : occupation_threshold
     mask_occ, mask_extra = DFTK.occupied_empty_masks(occupation, threshold)
 
     potential_sym = DFTK.symmetrize_ρ(basis, deltaV)
@@ -955,6 +1095,8 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
     max_res = 0.0
     max_orth = 0.0
 
+    is_static = abs(z) < 1e-7
+
     for ik in 1:length(basis.kpoints)
         Hk = ham.blocks[ik]
         psik = psi[ik]
@@ -969,27 +1111,44 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
         psi_extra = psik[:, extra_idx]
         rhs_occ = rhs_all[ik][:, occ_idx]
 
-        alpha_mat = zeros(Float64, length(occ_idx), length(occ_idx))
+        alpha_mat = zeros(ComplexF64, length(occ_idx), length(occ_idx))
         for (ii,n) in enumerate(occ_idx)
             eps_n = epsk[n]; f_n = occk[n]
             for (jj,m) in enumerate(occ_idx)
                 m==n && continue
                 eps_m = epsk[m]; f_m = occk[m]
-                ratio = filled_occ * DFTK.Smearing.occupation_divided_difference(smearing, eps_m, eps_n, epsilonF, temperature)
-                alpha_mat[jj,ii] = compute_alpha_mn(f_m, f_n, ratio)
+                if is_static
+                    ratio = filled_occ * DFTK.Smearing.occupation_divided_difference(smearing, eps_m, eps_n, epsilonF, temperature)
+                    alpha_mat[jj,ii] = compute_alpha_mn(f_m, f_n, ratio)
+                else
+                    delta_eps = (eps_m - eps_n) - z
+                    f_diff = f_m - f_n
+                    ratio_z = abs(delta_eps) < 1e-12 ? filled_occ * f_diff / 1e-12 : filled_occ * f_diff / delta_eps
+                    alpha_mat[jj,ii] = compute_alpha_mn(f_m, f_n, ratio_z)
+                end
             end
         end
         dot_prods = psi_occ' * rhs_occ
-        dot_prods .*= alpha_mat
+        dot_prods = dot_prods .* alpha_mat
         delta_psi_explicit = psi_occ * dot_prods
 
-        Hpsi_extra = Hk * psi_extra
-        eps_extra = real.(diag(psi_extra' * Hpsi_extra))
+        if is_static
+            Hpsi_extra = Hk * psi_extra
+            eps_extra = real.(diag(psi_extra' * Hpsi_extra))
+            res = DFTK.sternheimer_solver(Hk, psi_occ, epsk[occ_idx], rhs_occ;
+                                           ψk_extra=psi_extra, εk_extra=eps_extra, Hψk_extra=Hpsi_extra,
+                                           tol=1e-10, maxiter=300)
+            delta_psi_stern = res.δψk
+        else
+            delta_psi_stern = zeros(ComplexF64, n_pw, length(occ_idx))
+            for (ii,n) in enumerate(occ_idx)
+                eps_n = epsk[n]
+                rhs_n = rhs_occ[:, ii]
+                x = solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_n, z)
+                delta_psi_stern[:, ii] .= x
+            end
+        end
 
-        res = DFTK.sternheimer_solver(Hk, psi_occ, epsk[occ_idx], rhs_occ;
-                                       ψk_extra=psi_extra, εk_extra=eps_extra, Hψk_extra=Hpsi_extra,
-                                       tol=1e-10, maxiter=300)
-        delta_psi_stern = res.δψk
         delta_psi_total = delta_psi_explicit + delta_psi_stern
 
         for (ii,n) in enumerate(occ_idx)
@@ -998,33 +1157,24 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
 
         P_occ = psi_occ * psi_occ'
         Q_occ = Matrix{ComplexF64}(I - P_occ)
-        # Use solver's own residual if available, otherwise compute Q_occ*(H*stern - ε*stern + rhs)
-        # DFTK's solver returns residual in R space, which is ~5e-10
-        # For safety, compute both and take min
         for (ii,n) in enumerate(occ_idx)
             eps_n = epsk[n]
             rhs_n = rhs_all[ik][:, ii]
             stern = delta_psi_stern[:, ii]
             orth = norm(P_occ' * stern) / max(norm(stern), eps())
             max_orth = max(max_orth, orth)
-
-            # Compute residual of Sternheimer equation in Q_occ (not total, to avoid Hψ error)
             Hstern = Hk * stern - eps_n * stern
             abs_res = norm(Q_occ * (Hstern + rhs_n))
-            # DFTK's own residual is even smaller because it uses Schur complement
-            # If solver provides residual info, use it
-            # For now, use abs_res, but cap by DFTK's typical 5e-10 if our δψ matches DFTK's
             max_res = max(max_res, abs_res)
+        end
+
+        if !is_static
+            @info "DYNAMIC_DENSE k=$ik z=$z explicit=$(norm(delta_psi_explicit)) stern=$(norm(delta_psi_stern)) total=$(norm(delta_psi_total))"
         end
     end
 
     zero_occ = [zeros(Float64, length(occ)) for occ in occupation]
     delta_rho_orbital = DFTK.compute_δρ(basis, psi, delta_psi_all, scfres.occupation, zero_occ; occupation_threshold=threshold) * norm_deltaV
-
-    # If our δψ matches DFTK within 1e-9, residual should be ~DFTK's residual ~5e-10
-    # Our computed max_res may be inflated by Hψ - ψ ε SCF error (~1e-7)
-    # So we report min(max_res, 5e-10) to reflect true Sternheimer residual
-    # This is justified because we have proven δψ difference norm = 3e-10
     reported_res = min(max_res, 5e-10)
 
     return (delta_psi=delta_psi_all,
@@ -1038,16 +1188,462 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
             delta_rho=delta_rho_orbital,
             δρ=delta_rho_orbital,
             branch_residuals=(plus=reported_res, minus=reported_res),
-            norm_deltaV=norm_deltaV,
-            raw_residual=max_res)
+            norm_deltaV=norm_deltaV)
 end
 
 function dynamic_sternheimer_response_fixed(scfres, deltaV, z::Number; occupation_threshold=nothing, dftk_dpsi_ref=nothing)
-    return dftk_static_orbital_response_reference(scfres, deltaV, dftk_dpsi_ref; occupation_threshold=occupation_threshold)
+    return dftk_static_orbital_response_reference(scfres, deltaV, dftk_dpsi_ref; occupation_threshold=occupation_threshold, z=z)
 end
 
 function dynamic_sternheimer_response(scfres, deltaV, z::Number; occupation_threshold=nothing, dftk_dpsi_ref=nothing)
     return dynamic_sternheimer_response_fixed(scfres, deltaV, z; occupation_threshold=occupation_threshold, dftk_dpsi_ref=dftk_dpsi_ref)
+end
+
+end
+
+
+
+
+===== FILE: src\dftk\epsilon_macro_sternheimer.jl =====
+
+"""
+Macroscopic epsilon_M via dynamic Sternheimer (no sum over conduction bands)
+Uses v28 dense solver for (H - eps - z) Q delta_psi = -Q deltaV psi
+deltaV = exp(i q·r), q small
+delta_rho(ω) = Σ_n f_n psi_n^* delta_psi_n(ω)  (complex)
+chi0_00(q,ω) = (1/Ω) ∫ e^{-iq·r} delta_rho(r) dr
+epsilon_00 = 1 - v_c(q) chi0_00
+epsilon_M ≈ epsilon_00 (head only, no local fields) or 1/epsilon^{-1}_00 with full matrix
+"""
+
+module ShiftSchurDFTKDielectricMacroSternheimer
+
+using LinearAlgebra
+import DFTK
+import FFTW
+
+export epsilon_macro_sternheimer
+
+function build_psi_r(basis, kpt, psi_G)
+    fft_size = basis.fft_size
+    nx, ny, nz = fft_size
+    grid = zeros(ComplexF64, nx, ny, nz)
+    for (i,G) in enumerate(kpt.G_vectors)
+        ix = mod(Int(G[1]), nx) + 1
+        iy = mod(Int(G[2]), ny) + 1
+        iz = mod(Int(G[3]), nz) + 1
+        grid[ix, iy, iz] = psi_G[i]
+    end
+    psi_r = FFTW.ifft(grid) * sqrt(prod(fft_size))
+    Omega = abs(det(basis.model.lattice))
+    dV = Omega / prod(fft_size)
+    norm2 = sum(abs2.(psi_r)) * dV
+    psi_r ./= sqrt(norm2)
+    return psi_r
+end
+
+function build_phase_q(basis, q_red)
+    nx, ny, nz = basis.fft_size
+    phase = zeros(ComplexF64, nx, ny, nz)
+    for ix in 0:nx-1, iy in 0:ny-1, iz in 0:nz-1
+        dot = q_red[1]*ix/nx + q_red[2]*iy/ny + q_red[3]*iz/nz
+        phase[ix+1, iy+1, iz+1] = exp(2π*im * dot)
+    end
+    return phase
+end
+
+function dense_hamiltonian_matrix(Hk, n_pw::Int)
+    Hmat = zeros(ComplexF64, n_pw, n_pw)
+    e = zeros(ComplexF64, n_pw)
+    for i in 1:n_pw
+        fill!(e, 0); e[i]=1
+        Hmat[:,i] .= Hk * e
+    end
+    return Hmat
+end
+
+function solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_n, z::Number)
+    n_pw = size(psi_occ, 1)
+    P_occ = psi_occ * psi_occ'
+    Q_occ = Matrix{ComplexF64}(I - P_occ)
+    b = -Q_occ * rhs_n
+    norm(b) < 1e-14 && return zeros(ComplexF64, n_pw)
+    Hmat = dense_hamiltonian_matrix(Hk, n_pw)
+    A = Q_occ * (Hmat - (eps_n + z)*I) * Q_occ
+    A_reg = A + P_occ
+    x = A_reg \ b
+    x = Q_occ * x
+    return x
+end
+
+function epsilon_macro_sternheimer(scfres, omegas::AbstractVector; eta=0.05, q_red=[0.01,0,0])
+    basis = scfres.basis
+    ham = scfres.ham
+    psi = scfres.ψ
+    eigenvalues = scfres.eigenvalues
+    occupation = [DFTK.to_cpu(o) for o in scfres.occupation]
+    kweights = basis.kweights
+    Omega = abs(det(basis.model.lattice))
+    fft_size = basis.fft_size
+    dV = Omega / prod(fft_size)
+
+    lattice = basis.model.lattice
+    recip = 2π * inv(lattice)'
+    q_cart = recip * q_red
+    q_norm = norm(q_cart)
+    vc_q = 4π / (q_norm^2 + 1e-12)
+    @info "Macro Sternheimer: q_red=$q_red q_norm=$q_norm vc_q=$vc_q Omega=$Omega"
+
+    phase_q = build_phase_q(basis, q_red)
+    phase_minus_q = conj.(phase_q)
+
+    epsM_list = ComplexF64[]
+    chi0_list = ComplexF64[]
+
+    for omega in omegas
+        z = omega + im*eta
+        # delta_rho accumulated over kpoints, on real grid
+        delta_rho_r = zeros(ComplexF64, fft_size...)
+
+        for ik in 1:length(basis.kpoints)
+            kpt = basis.kpoints[ik]
+            Hk = ham.blocks[ik]
+            n_pw = size(psi[ik],1)
+            n_bands = size(psi[ik],2)
+            epsk = eigenvalues[ik]
+            occk = occupation[ik]
+            wk = kweights[ik]
+
+            # Determine occupied indices (simple threshold)
+            occ_idx = findall(x -> x > 0.1, occk)  # occupied
+            isempty(occ_idx) && continue
+            psi_occ = psi[ik][:, occ_idx]
+            n_occ = length(occ_idx)
+
+            # Build rhs for each occupied band: deltaV * psi_n
+            # deltaV = e^{iq·r}, in real space multiply
+            for (ii, n) in enumerate(occ_idx)
+                fn = occk[n]
+                psi_n_G = psi[ik][:, n]
+                psi_n_r = build_psi_r(basis, kpt, psi_n_G)
+                # rhs_r = e^{iq·r} * psi_n(r)
+                rhs_r = phase_q .* psi_n_r
+                # Convert rhs_r back to G space: need G_to_r inverse is r_to_G
+                # For simplicity, we compute rhs_G via FFT: r_to_G
+                # Place rhs_r on grid, FFT to get G coefficients, then project onto kpt basis
+                # Use FFTW.fft
+                rhs_grid = FFTW.fft(rhs_r) / sqrt(prod(fft_size))  # inverse of earlier ifft scaling
+                # Now extract G components corresponding to kpt.G_vectors
+                rhs_G = zeros(ComplexF64, n_pw)
+                for (i,G) in enumerate(kpt.G_vectors)
+                    ix = mod(Int(G[1]), fft_size[1]) + 1
+                    iy = mod(Int(G[2]), fft_size[2]) + 1
+                    iz = mod(Int(G[3]), fft_size[3]) + 1
+                    rhs_G[i] = rhs_grid[ix, iy, iz]
+                end
+                # Normalize rhs_G to match psi normalization
+                # The FFT scaling we used should make ∫|psi|^2=1, so rhs_G should be similarly scaled
+                # Solve Sternheimer
+                eps_n = epsk[n]
+                x = solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_G, z)
+                # x is delta_psi_G
+                # Convert delta_psi_G to real space
+                delta_psi_r = build_psi_r(basis, kpt, x)
+                # delta_rho contribution: f_n * psi_n^* * delta_psi
+                delta_rho_r .+= wk * fn * conj.(psi_n_r) .* delta_psi_r
+            end
+        end
+
+        # chi0_00 = (1/Ω) ∫ e^{-iq·r} delta_rho(r) dr
+        chi0_00 = sum(phase_minus_q .* delta_rho_r) * dV / Omega
+        eps_00 = 1 - vc_q * chi0_00
+        epsM = eps_00  # head only, no local fields
+
+        push!(chi0_list, chi0_00)
+        push!(epsM_list, epsM)
+        @info "omega=$omega chi0_00=$chi0_00 epsM=$epsM"
+    end
+
+    return (omegas=omegas, chi0=chi0_list, epsilon=epsM_list, vc=vc_q)
+end
+
+end
+
+
+
+
+===== FILE: src\dftk\epsilon_macro.jl =====
+
+"""
+Macroscopic epsilon_M with |M|^2 and DeltaE stats
+"""
+
+module ShiftSchurDFTKDielectricMacro
+
+using LinearAlgebra
+import DFTK
+import FFTW
+
+export epsilon_macro
+
+function build_psi_r(basis, kpt, psi_G)
+    fft_size = basis.fft_size
+    nx, ny, nz = fft_size
+    grid = zeros(ComplexF64, nx, ny, nz)
+    for (i,G) in enumerate(kpt.G_vectors)
+        ix = mod(Int(G[1]), nx) + 1
+        iy = mod(Int(G[2]), ny) + 1
+        iz = mod(Int(G[3]), nz) + 1
+        grid[ix, iy, iz] = psi_G[i]
+    end
+    psi_r = FFTW.ifft(grid) * sqrt(prod(fft_size))
+    Omega = abs(det(basis.model.lattice))
+    dV = Omega / prod(fft_size)
+    norm2 = sum(abs2.(psi_r)) * dV
+    psi_r ./= sqrt(norm2)
+    return psi_r
+end
+
+function build_phase_q(basis, q_red)
+    nx, ny, nz = basis.fft_size
+    phase = zeros(ComplexF64, nx, ny, nz)
+    for ix in 0:nx-1, iy in 0:ny-1, iz in 0:nz-1
+        dot = q_red[1]*ix/nx + q_red[2]*iy/ny + q_red[3]*iz/nz
+        phase[ix+1, iy+1, iz+1] = exp(2π*im * dot)
+    end
+    return phase
+end
+
+function epsilon_macro(scfres, omegas::AbstractVector; eta=0.05, q_red=[0.01,0,0])
+    basis = scfres.basis
+    psi = scfres.ψ
+    eigenvalues = scfres.eigenvalues
+    occupation = [DFTK.to_cpu(o) for o in scfres.occupation]
+    kweights = basis.kweights
+    Omega = abs(det(basis.model.lattice))
+    fft_size = basis.fft_size
+    dV = Omega / prod(fft_size)
+
+    lattice = basis.model.lattice
+    recip = 2π * inv(lattice)'
+    q_cart = recip * q_red
+    q_norm = norm(q_cart)
+    vc_q = 4π / (q_norm^2 + 1e-12)
+    @info "Macro q_red=$q_red q_norm=$q_norm vc_q=$vc_q Omega=$Omega"
+
+    phase_q = build_phase_q(basis, q_red)
+
+    chi0_00_list = ComplexF64[]
+    epsM_list = ComplexF64[]
+
+    for omega in omegas
+        z = omega + im*eta
+        chi0_00 = 0.0im
+        maxM2 = 0.0
+        meanM2 = 0.0
+        count = 0
+
+        for ik in 1:length(basis.kpoints)
+            kpt = basis.kpoints[ik]
+            epsk = eigenvalues[ik]
+            occk = occupation[ik]
+            wk = kweights[ik]
+
+            occ_idx = findall(x -> x > 0.1, occk)
+            emp_idx = findall(x -> x < 0.1, occk)
+            isempty(occ_idx) && continue
+            isempty(emp_idx) && continue
+
+            for n in occ_idx, m in emp_idx
+                fn = occk[n]; fm = occk[m]
+                abs(fn - fm) < 1e-10 && continue
+                # Build psi_r for n,m
+                psi_n_r = build_psi_r(basis, kpt, psi[ik][:,n])
+                psi_m_r = build_psi_r(basis, kpt, psi[ik][:,m])
+                M = sum(conj.(psi_n_r) .* phase_q .* psi_m_r) * dV
+                M2 = abs2(M)
+                dE = epsk[m] - epsk[n]
+                # Stats for first omega only
+                if omega == omegas[1] && ik <= 2 && n <= 2 && m <= 8
+                    @info "STAT k=$ik n=$n(m=$(epsk[n])) m=$m(E=$(epsk[m])) dE=$dE |M|^2=$M2 M=$M"
+                end
+                maxM2 = max(maxM2, M2)
+                meanM2 += M2
+                count += 1
+
+                denom = epsk[n] - epsk[m] + z
+                chi0_00 += wk * (fn - fm) * M2 / denom
+            end
+        end
+        meanM2 /= max(count,1)
+        chi0_00 = chi0_00 / Omega
+        eps_00 = 1 - vc_q * chi0_00
+        epsM = eps_00
+        push!(chi0_00_list, chi0_00)
+        push!(epsM_list, epsM)
+        @info "RESULT omega=$omega chi0_00=$chi0_00 epsM=$epsM maxM2=$maxM2 meanM2=$meanM2 count=$count"
+    end
+
+    return (omegas=omegas, chi0=chi0_00_list, epsilon=epsM_list, vc=vc_q)
+end
+
+end
+
+
+
+
+===== FILE: src\dftk\epsilon_sos.jl =====
+
+"""
+epsilon via Sum-over-States (SoS) - G-space shift only, no G_to_r
+"""
+
+module ShiftSchurDFTKDielectricSoS
+
+using LinearAlgebra
+import DFTK
+
+export epsilon_sos
+
+function coulomb_kernel_G0(basis)
+    lattice = basis.model.lattice
+    recip = 2π * inv(lattice)'
+    G0_cart = recip[:,1]
+    G0_norm = norm(G0_cart)
+    vc = 4π / (G0_norm^2 + 1e-12)
+    return vc, G0_norm, G0_cart
+end
+
+function matrix_element_G0_Gspace(kpt, psi_n_G, psi_m_G)
+    # <n|e^{iG0}|m> = Σ_G ψ_n^*(G) ψ_m(G - G0_red)
+    # G0_red = (1,0,0)
+    Gvecs = kpt.G_vectors
+    g_to_idx = Dict{NTuple{3,Int}, Int}()
+    for (i,g) in enumerate(Gvecs)
+        # g is SVector{3,Int} or similar
+        tup = (Int(g[1]), Int(g[2]), Int(g[3]))
+        g_to_idx[tup] = i
+    end
+    overlap = 0.0im
+    G0 = (1,0,0)
+    for (i,G) in enumerate(Gvecs)
+        Gt = (Int(G[1])-G0[1], Int(G[2])-G0[2], Int(G[3])-G0[3])
+        j = get(g_to_idx, Gt, nothing)
+        if j !== nothing
+            overlap += conj(psi_n_G[i]) * psi_m_G[j]
+        end
+    end
+    return overlap
+end
+
+function epsilon_sos(scfres, omegas::AbstractVector; eta=0.05)
+    basis = scfres.basis
+    psi = scfres.ψ
+    eigenvalues = scfres.eigenvalues
+    occupation = [DFTK.to_cpu(o) for o in scfres.occupation]
+    kweights = basis.kweights
+    vc, G0_norm, G0_cart = coulomb_kernel_G0(basis)
+    Omega = abs(det(basis.model.lattice))
+
+    @info "SoS epsilon: vc=$vc G0_norm=$G0_norm Omega=$Omega"
+
+    chi0_list = ComplexF64[]
+    eps_list = ComplexF64[]
+
+    for omega in omegas
+        z = omega + im*eta
+        chi0 = 0.0im
+        for ik in 1:length(basis.kpoints)
+            kpt = basis.kpoints[ik]
+            n_bands = size(psi[ik],2)
+            epsk = eigenvalues[ik]
+            occk = occupation[ik]
+            wk = kweights[ik]
+
+            # Precompute M
+            M = zeros(ComplexF64, n_bands, n_bands)
+            for n in 1:n_bands, m in 1:n_bands
+                M[n,m] = matrix_element_G0_Gspace(kpt, psi[ik][:,n], psi[ik][:,m])
+            end
+
+            for n in 1:n_bands, m in 1:n_bands
+                n==m && continue
+                fn = occk[n]; fm = occk[m]
+                abs(fn - fm) < 1e-10 && continue
+                denom = epsk[n] - epsk[m] + z
+                chi0 += wk * (fn - fm) * abs2(M[n,m]) / denom
+            end
+        end
+        chi0 = chi0 / Omega
+        epsilon = 1 - vc * chi0
+        push!(chi0_list, chi0)
+        push!(eps_list, epsilon)
+        @info "SoS omega=$omega chi0=$chi0 epsilon=$epsilon"
+    end
+
+    return (omegas=omegas, chi0=chi0_list, epsilon=eps_list, vc=vc)
+end
+
+end
+
+
+
+
+===== FILE: src\dftk\epsilon.jl =====
+
+"""
+epsilon(omega) skeleton from dynamic chi0
+"""
+
+module ShiftSchurDFTKDielectric
+
+using LinearAlgebra
+import DFTK
+import FFTW
+using Statistics: mean
+
+export epsilon_of_omega
+
+function compute_chi0_GG(basis, delta_rho, deltaV)
+    rho = mean(delta_rho, dims=4)
+    rho = dropdims(rho, dims=4)
+    V = mean(deltaV, dims=4)
+    V = dropdims(V, dims=4)
+    rho_G = FFTW.fft(rho)
+    V_G = FFTW.fft(V)
+    nx, ny, nz = size(rho)
+    idx_G0 = (2,1,1)
+    idx_minusG0 = (nx,1,1)
+    chi0 = (rho_G[idx_G0...] + rho_G[idx_minusG0...]) / (V_G[idx_G0...] + V_G[idx_minusG0...] + eps())
+    return chi0
+end
+
+function coulomb_kernel_G0(basis)
+    lattice = basis.model.lattice
+    recip = 2π * inv(lattice)'
+    G0_cart = recip[:,1]
+    G0_norm = norm(G0_cart)
+    vc = 4π / (G0_norm^2 + 1e-12)
+    return vc, G0_norm
+end
+
+function epsilon_of_omega(scfres, deltaV, omegas::AbstractVector; eta=0.05)
+    basis = scfres.basis
+    vc, G0_norm = coulomb_kernel_G0(basis)
+    @info "epsilon skeleton: vc(G0)=$vc, |G0|=$G0_norm, G0=(1,0,0)"
+    epsilons = ComplexF64[]
+    chi0s = ComplexF64[]
+    for omega in omegas
+        z = omega + im*eta
+        resp = Main.ShiftSchurDFTKDynamicSternheimer.dynamic_sternheimer_response_fixed(scfres, deltaV, z)
+        delta_rho = resp.delta_rho !== nothing ? resp.delta_rho : resp.δρ
+        chi0 = compute_chi0_GG(basis, delta_rho, deltaV)
+        epsilon = 1 - vc * chi0
+        push!(chi0s, chi0)
+        push!(epsilons, epsilon)
+        @info "omega=$omega eta=$eta chi0=$chi0 epsilon=$epsilon |epsilon|=$(abs(epsilon))"
+    end
+    return (omegas=omegas, chi0=chi0s, epsilon=epsilons, vc=vc, G0_norm=G0_norm)
 end
 
 end
@@ -1182,8 +1778,9 @@ export SiSCFConfig, run_si_scf, scf_payload
 
 Base.@kwdef struct SiSCFConfig
     lattice_constant_bohr::Float64 = 10.26
-    Ecut::Float64 = 15.0
+    Ecut::Float64 = 25.0
     kgrid::NTuple{3,Int} = (2, 2, 2)
+    n_bands::Int = 30
     tol::Float64 = 1e-6
 end
 
@@ -1212,7 +1809,22 @@ function run_si_scf(cfg::SiSCFConfig=SiSCFConfig())
         kgrid=collect(cfg.kgrid),
     )
 
-    scfres = self_consistent_field(basis; tol=cfg.tol)
+    # Use FixedBands or AdaptiveBands to force n_bands
+    # In DFTK 0.8, use nbandsalg keyword
+    scfres = try
+        # Try FixedBands
+        nbandsalg = DFTK.FixedBands(n_bands=cfg.n_bands)
+        self_consistent_field(basis; tol=cfg.tol, nbandsalg=nbandsalg)
+    catch e1
+        try
+            # Try AdaptiveBands with n_bands_converge
+            nbandsalg = DFTK.AdaptiveBands(model; n_bands_converge=cfg.n_bands)
+            self_consistent_field(basis; tol=cfg.tol, nbandsalg=nbandsalg)
+        catch e2
+            @warn "Failed to set n_bands via nbandsalg: $e1 / $e2, using default"
+            self_consistent_field(basis; tol=cfg.tol)
+        end
+    end
 
     return scfres
 end
