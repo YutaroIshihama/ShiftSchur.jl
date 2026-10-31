@@ -8,9 +8,9 @@ export SiSCFConfig, run_si_scf, scf_payload
 
 Base.@kwdef struct SiSCFConfig
     lattice_constant_bohr::Float64 = 10.26
-    Ecut::Float64 = 30.0
-    kgrid::NTuple{3,Int} = (6, 6, 6)
-    n_bands::Int = 60
+    Ecut::Float64 = 25.0
+    kgrid::NTuple{3,Int} = (2, 2, 2)
+    n_bands::Int = 30
     tol::Float64 = 1e-6
 end
 
