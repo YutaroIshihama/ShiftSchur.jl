@@ -33,31 +33,6 @@ struct OrbitalDecomposition
     n_bands::Int
 end
 
-# --- Robust helper for DFTK mask handling (Bool mask vs index list vs 0/1 Int mask) ---
-_to_indices(mask, n_bands::Int) = _to_indices_impl(mask, n_bands)
-function _to_indices_impl(mask, n_bands::Int)
-    if mask isa AbstractVector{Bool}
-        return findall(mask)
-    elseif eltype(mask) <: Bool
-        return findall(mask)
-    elseif eltype(mask) <: Integer
-        # 0/1 mask of length n_bands -> convert
-        if length(mask) == n_bands && all(x -> x==0 || x==1, mask)
-            return findall(x -> x!=0, mask)
-        else
-            # already list of indices (DFTK sometimes returns Vector{Int} indices)
-            return collect(Int, mask)
-        end
-    else
-        # fallback: try findall, if fails assume Bool-like
-        try
-            return findall(mask)
-        catch
-            return findall(x -> x!=0 && x!=false, mask)
-        end
-    end
-end
-
 function dftk_static_orbital_response_reference(scfres, δV::AbstractArray;
                                                 occupation_threshold=nothing,
                                                 droptol=nothing)
@@ -86,8 +61,8 @@ function dftk_static_orbital_response_reference(scfres, δV::AbstractArray;
         ψk = ψ[ik]
         εk = ε[ik]
         n_pw, n_bands = size(ψk)
-        occ_idx = _to_indices(mask_occ[ik], n_bands)
-        extra_idx = _to_indices(mask_empty[ik], n_bands)
+        occ_idx = findall(mask_occ[ik])
+        extra_idx = findall(mask_empty[ik])
         n_occ = length(occ_idx)
         length(occ_idx)==0 && continue
 
@@ -190,8 +165,8 @@ function dynamic_sternheimer_response_fixed(scfres, δV::AbstractArray, z::Numbe
         ψk = ψ[ik]
         εk = ε[ik]
         n_pw, n_bands = size(ψk)
-        occ_idx = _to_indices(mask_occ[ik], n_bands)
-        extra_idx = _to_indices(mask_empty[ik], n_bands)
+        occ_idx = findall(mask_occ[ik])
+        extra_idx = findall(mask_empty[ik])
         length(occ_idx)==0 && continue
 
         Id_pw = Matrix{ComplexF64}(I, n_pw, n_pw)
