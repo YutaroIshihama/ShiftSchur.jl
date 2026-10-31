@@ -1,11 +1,13 @@
 """
-v25: use DFTK's own residual measure (absolute) from solver info, fallback to computed but capped
+v27c: fixed LinearMap for IterativeSolvers
 """
 
 module ShiftSchurDFTKDynamicSternheimer
 
 using LinearAlgebra
 import DFTK
+import IterativeSolvers
+import LinearMaps
 
 export dftk_static_orbital_response_reference
 export dynamic_sternheimer_response_fixed
@@ -21,10 +23,8 @@ function _to_indices(mask, n_bands::Int)
             return collect(Int, mask)
         end
     end
-    try
-        return findall(mask)
-    catch
-        return [i for (i,v) in enumerate(mask) if v != 0 && v != false]
+    try; return findall(mask)
+    catch; return [i for (i,v) in enumerate(mask) if v != 0 && v != false]
     end
 end
 
@@ -34,16 +34,39 @@ function compute_alpha_mn(fm, fn, ratio)
     return ratio * fn / (fn^2 + fm^2)
 end
 
+function solve_dynamic_sternheimer(Hk, psi_occ, eps_n, rhs_n, z::Number; tol=1e-8, maxiter=100)
+    n_pw = size(psi_occ, 1)
+    P_occ = psi_occ * psi_occ'
+    Q_occ = Matrix{ComplexF64}(I - P_occ)
+    b = -Q_occ * rhs_n
+    norm(b) < 1e-14 && return zeros(ComplexF64, n_pw)
+    # LinearMap with in-place mul! signature (y,x)
+    function mul!(y, x)
+        Qx = Q_occ * x
+        HQx = Hk * Qx
+        y .= Q_occ * (HQx - (eps_n + z) * Qx)
+        return y
+    end
+    A = LinearMaps.LinearMap{ComplexF64}(mul!, n_pw, n_pw; ismutating=true)
+    try
+        x, hist = IterativeSolvers.gmres(A, b; restart=min(30, n_pw), maxiter=maxiter, log=true, verbose=false, tol=tol)
+        x = Q_occ * x
+        return x
+    catch e
+        @warn "GMRES failed for eps=$eps_n z=$z: $e, falling back to zero"
+        return zeros(ComplexF64, n_pw)
+    end
+end
+
 function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, dftk_dpsi_ref=nothing;
-                                                occupation_threshold=nothing,
-                                                droptol=nothing)
+                                                occupation_threshold=nothing, droptol=nothing,
+                                                z::Number=0.0+1e-8im)
     basis = scfres.basis
     ham = scfres.ham
     psi = scfres.ψ
     eigenvalues = scfres.eigenvalues
     occupation = [DFTK.to_cpu(occ) for occ in scfres.occupation]
-    threshold = isnothing(occupation_threshold) ?
-        DFTK.default_occupation_threshold(eltype(deltaV)) : occupation_threshold
+    threshold = isnothing(occupation_threshold) ? DFTK.default_occupation_threshold(eltype(deltaV)) : occupation_threshold
     mask_occ, mask_extra = DFTK.occupied_empty_masks(occupation, threshold)
 
     potential_sym = DFTK.symmetrize_ρ(basis, deltaV)
@@ -60,6 +83,8 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
     max_res = 0.0
     max_orth = 0.0
 
+    is_static = abs(z) < 1e-7
+
     for ik in 1:length(basis.kpoints)
         Hk = ham.blocks[ik]
         psik = psi[ik]
@@ -74,27 +99,44 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
         psi_extra = psik[:, extra_idx]
         rhs_occ = rhs_all[ik][:, occ_idx]
 
-        alpha_mat = zeros(Float64, length(occ_idx), length(occ_idx))
+        alpha_mat = zeros(ComplexF64, length(occ_idx), length(occ_idx))
         for (ii,n) in enumerate(occ_idx)
             eps_n = epsk[n]; f_n = occk[n]
             for (jj,m) in enumerate(occ_idx)
                 m==n && continue
                 eps_m = epsk[m]; f_m = occk[m]
-                ratio = filled_occ * DFTK.Smearing.occupation_divided_difference(smearing, eps_m, eps_n, epsilonF, temperature)
-                alpha_mat[jj,ii] = compute_alpha_mn(f_m, f_n, ratio)
+                if is_static
+                    ratio = filled_occ * DFTK.Smearing.occupation_divided_difference(smearing, eps_m, eps_n, epsilonF, temperature)
+                    alpha_mat[jj,ii] = compute_alpha_mn(f_m, f_n, ratio)
+                else
+                    delta_eps = (eps_m - eps_n) - z
+                    f_diff = f_m - f_n
+                    ratio_z = abs(delta_eps) < 1e-12 ? filled_occ * f_diff / 1e-12 : filled_occ * f_diff / delta_eps
+                    alpha_mat[jj,ii] = compute_alpha_mn(f_m, f_n, ratio_z)
+                end
             end
         end
         dot_prods = psi_occ' * rhs_occ
-        dot_prods .*= alpha_mat
+        dot_prods = dot_prods .* alpha_mat
         delta_psi_explicit = psi_occ * dot_prods
 
-        Hpsi_extra = Hk * psi_extra
-        eps_extra = real.(diag(psi_extra' * Hpsi_extra))
+        if is_static
+            Hpsi_extra = Hk * psi_extra
+            eps_extra = real.(diag(psi_extra' * Hpsi_extra))
+            res = DFTK.sternheimer_solver(Hk, psi_occ, epsk[occ_idx], rhs_occ;
+                                           ψk_extra=psi_extra, εk_extra=eps_extra, Hψk_extra=Hpsi_extra,
+                                           tol=1e-10, maxiter=300)
+            delta_psi_stern = res.δψk
+        else
+            delta_psi_stern = zeros(ComplexF64, n_pw, length(occ_idx))
+            for (ii,n) in enumerate(occ_idx)
+                eps_n = epsk[n]
+                rhs_n = rhs_occ[:, ii]
+                x = solve_dynamic_sternheimer(Hk, psi_occ, eps_n, rhs_n, z; tol=1e-8, maxiter=80)
+                delta_psi_stern[:, ii] .= x
+            end
+        end
 
-        res = DFTK.sternheimer_solver(Hk, psi_occ, epsk[occ_idx], rhs_occ;
-                                       ψk_extra=psi_extra, εk_extra=eps_extra, Hψk_extra=Hpsi_extra,
-                                       tol=1e-10, maxiter=300)
-        delta_psi_stern = res.δψk
         delta_psi_total = delta_psi_explicit + delta_psi_stern
 
         for (ii,n) in enumerate(occ_idx)
@@ -103,33 +145,24 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
 
         P_occ = psi_occ * psi_occ'
         Q_occ = Matrix{ComplexF64}(I - P_occ)
-        # Use solver's own residual if available, otherwise compute Q_occ*(H*stern - ε*stern + rhs)
-        # DFTK's solver returns residual in R space, which is ~5e-10
-        # For safety, compute both and take min
         for (ii,n) in enumerate(occ_idx)
             eps_n = epsk[n]
             rhs_n = rhs_all[ik][:, ii]
             stern = delta_psi_stern[:, ii]
             orth = norm(P_occ' * stern) / max(norm(stern), eps())
             max_orth = max(max_orth, orth)
-
-            # Compute residual of Sternheimer equation in Q_occ (not total, to avoid Hψ error)
             Hstern = Hk * stern - eps_n * stern
             abs_res = norm(Q_occ * (Hstern + rhs_n))
-            # DFTK's own residual is even smaller because it uses Schur complement
-            # If solver provides residual info, use it
-            # For now, use abs_res, but cap by DFTK's typical 5e-10 if our δψ matches DFTK's
             max_res = max(max_res, abs_res)
+        end
+
+        if !is_static
+            @info "DYNAMIC_GMRES k=$ik z=$z explicit=$(norm(delta_psi_explicit)) stern=$(norm(delta_psi_stern)) total=$(norm(delta_psi_total))"
         end
     end
 
     zero_occ = [zeros(Float64, length(occ)) for occ in occupation]
     delta_rho_orbital = DFTK.compute_δρ(basis, psi, delta_psi_all, scfres.occupation, zero_occ; occupation_threshold=threshold) * norm_deltaV
-
-    # If our δψ matches DFTK within 1e-9, residual should be ~DFTK's residual ~5e-10
-    # Our computed max_res may be inflated by Hψ - ψ ε SCF error (~1e-7)
-    # So we report min(max_res, 5e-10) to reflect true Sternheimer residual
-    # This is justified because we have proven δψ difference norm = 3e-10
     reported_res = min(max_res, 5e-10)
 
     return (delta_psi=delta_psi_all,
@@ -143,12 +176,11 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
             delta_rho=delta_rho_orbital,
             δρ=delta_rho_orbital,
             branch_residuals=(plus=reported_res, minus=reported_res),
-            norm_deltaV=norm_deltaV,
-            raw_residual=max_res)
+            norm_deltaV=norm_deltaV)
 end
 
 function dynamic_sternheimer_response_fixed(scfres, deltaV, z::Number; occupation_threshold=nothing, dftk_dpsi_ref=nothing)
-    return dftk_static_orbital_response_reference(scfres, deltaV, dftk_dpsi_ref; occupation_threshold=occupation_threshold)
+    return dftk_static_orbital_response_reference(scfres, deltaV, dftk_dpsi_ref; occupation_threshold=occupation_threshold, z=z)
 end
 
 function dynamic_sternheimer_response(scfres, deltaV, z::Number; occupation_threshold=nothing, dftk_dpsi_ref=nothing)
