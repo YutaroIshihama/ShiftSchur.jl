@@ -17,6 +17,7 @@ function AuxiliaryLinearization(A, B, D; T=promote_type(eltype(A),eltype(B),elty
     AuxiliaryLinearization{typeof(A),typeof(B),typeof(D),T}(A,B,D,n,m,zeros(T,n),zeros(T,m))
 end
 Base.size(H::AuxiliaryLinearization)=(H.nphys+H.naux,H.nphys+H.naux)
+Base.size(H::AuxiliaryLinearization, d::Integer) = d == 1 || d == 2 ? H.nphys + H.naux : 1
 Base.eltype(H::AuxiliaryLinearization{TA,TB,TD,T}) where {TA,TB,TD,T}=T
 
 function LinearAlgebra.mul!(y::AbstractVector, H::AuxiliaryLinearization, x::AbstractVector)
