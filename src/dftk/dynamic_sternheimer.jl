@@ -38,7 +38,7 @@ function dynamic_sternheimer_response(scfres, δV::AbstractArray, z::Number;
 
     for (ik, kpt) in enumerate(basis.kpoints)
         ψk = ψ[ik]
-        occ_indices = findall(mask_occ[ik])
+        occ_indices = collect(mask_occ[ik])
         ψocc = ψk[:, occ_indices]
         size(ψocc, 2) == 0 && continue
 
