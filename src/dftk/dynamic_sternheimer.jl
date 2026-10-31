@@ -30,6 +30,7 @@ function dynamic_sternheimer_response(scfres, δV::AbstractArray, z::Number;
 
     potential = DFTK.symmetrize_ρ(basis, δV)
     rhs = DFTK.apply_potential_blochwave(basis, ψ, potential)
+    δψ_plus_all = zero.(rhs)
     T = eltype(basis)
     δρ = zeros(Complex{T}, (basis.fft_size..., basis.model.n_spin_components))
     max_residual = zero(T)
@@ -63,6 +64,7 @@ function dynamic_sternheimer_response(scfres, δV::AbstractArray, z::Number;
                 (δψ=δψn, residual=residual, orthogonality=orthogonality)
             end
             plus, minus = branch_results
+            δψ_plus_all[ik][:, n] .= plus.δψ
             max_residual = max(max_residual, plus.residual, minus.residual)
             max_branch_residuals = (
                 plus=max(max_branch_residuals.plus, plus.residual),
@@ -83,7 +85,8 @@ function dynamic_sternheimer_response(scfres, δV::AbstractArray, z::Number;
     DFTK.mpi_sum!(δρ, basis.comm_kpts)
     δρ = DFTK.symmetrize_ρ(basis, δρ)
 
-    return (δρ=δρ, orbital_residual=max_residual,
+    return (δρ=δρ, delta_psi_plus=δψ_plus_all,
+            orbital_residual=max_residual,
             branch_residuals=max_branch_residuals,
             occupied_orthogonality_error=max_orthogonality, z=z)
 end

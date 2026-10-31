@@ -1,6 +1,7 @@
 using LinearAlgebra
 using Printf
 using ShiftSchur
+using DFTK
 include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
 include(joinpath(@__DIR__, "..", "src", "dftk", "si_response_adapter.jl"))
 using .ShiftSchurDFTKSiSCF
@@ -13,12 +14,30 @@ static_reference = static_smoke.delta_rho0
 
 z_static = 1e-8im
 static_limit = dynamic_sternheimer_response(payload.raw, δV, z_static)
-static_relative_error = norm(static_limit.δρ - static_reference) /
-                        max(norm(static_reference), eps(Float64))
+occupation_threshold = DFTK.default_occupation_threshold(eltype(δV))
+dftk_reconstructed = DFTK.compute_δρ(
+    payload.basis, payload.psi, static_limit.delta_psi_plus,
+    payload.raw.occupation, static_smoke.raw.δoccupation;
+    occupation_threshold=occupation_threshold)
+manual_dynamic = static_limit.δρ
+relative_error(a, b) = norm(a - b) / max(norm(b), eps(Float64))
+error_dftk_reconstruction_vs_reference =
+    relative_error(dftk_reconstructed, static_reference)
+error_manual_vs_reference = relative_error(manual_dynamic, static_reference)
+error_manual_vs_dftk_reconstruction = relative_error(manual_dynamic, dftk_reconstructed)
+static_relative_error = error_manual_vs_reference
 
 println("=== DFTK dynamic Sternheimer oracle (validation only) ===")
 println("static-limit z = ", z_static)
-@printf("relative density error vs DFTK.apply_χ0 = %.8e\n", static_relative_error)
+@printf("error_dftk_reconstruction_vs_reference = %.8e\n",
+        error_dftk_reconstruction_vs_reference)
+@printf("error_manual_vs_reference              = %.8e\n",
+        error_manual_vs_reference)
+@printf("error_manual_vs_dftk_reconstruction    = %.8e\n",
+        error_manual_vs_dftk_reconstruction)
+@printf("norm(reference)                         = %.8e\n", norm(static_reference))
+@printf("norm(dftk_reconstructed)                = %.8e\n", norm(dftk_reconstructed))
+@printf("norm(manual_dynamic)                    = %.8e\n", norm(manual_dynamic))
 @printf("orbital Sternheimer residual           = %.8e\n", static_limit.orbital_residual)
 @printf("occupied-space orthogonality error     = %.8e\n",
         static_limit.occupied_orthogonality_error)
