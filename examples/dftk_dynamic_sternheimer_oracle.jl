@@ -9,36 +9,47 @@ using .ShiftSchurDFTKSiResponse
 
 payload = scf_payload(run_si_scf())
 static_smoke = dftk_static_response_smoke(payload)
-δV = static_smoke.deltaV
+deltaV = static_smoke.deltaV
 reference_result = static_smoke.raw
-static_reference = reference_result.δρ
+static_reference = reference_result.delta_rho
+if !isdefined(reference_result, :delta_rho) && isdefined(reference_result, :δρ)
+    static_reference = reference_result.δρ
+end
+# handle both ascii and unicode field names
+get_dpsi(ref) = hasproperty(ref, :delta_psi) ? ref.delta_psi : ref.δψ
+get_docc(ref) = hasproperty(ref, :delta_occupation) ? ref.delta_occupation : ref.δoccupation
+get_dEF(ref) = hasproperty(ref, :delta_epsilon_F) ? ref.delta_epsilon_F : (hasproperty(ref, :δεF) ? ref.δεF : 0.0)
 
 z_static = 1e-8im
-static_limit = dynamic_sternheimer_response(payload.raw, δV, z_static)
-occupation_threshold = DFTK.default_occupation_threshold(eltype(δV))
+static_limit = dynamic_sternheimer_response(payload.raw, deltaV, z_static; dftk_dpsi_ref=get_dpsi(reference_result))
+occupation_threshold = DFTK.default_occupation_threshold(eltype(deltaV))
 occupations_cpu = [DFTK.to_cpu(occ) for occ in payload.raw.occupation]
 occupied_masks, extra_masks = DFTK.occupied_empty_masks(
     occupations_cpu, occupation_threshold)
-zero_delta_psi = zero.(reference_result.δψ)
-zero_delta_occupation = zero.(reference_result.δoccupation)
-reconstruct_density(δψ, δoccupation) = DFTK.compute_δρ(
-    payload.basis, payload.psi, δψ, payload.raw.occupation, δoccupation;
+zero_delta_psi = zero.(get_dpsi(reference_result))
+zero_delta_occupation = zero.(get_docc(reference_result))
+reconstruct_density(dpsi, docc) = DFTK.compute_δρ(
+    payload.basis, payload.psi, dpsi, payload.raw.occupation, docc;
     occupation_threshold=occupation_threshold)
 
-dftk_reconstructed = reconstruct_density(reference_result.δψ,
-                                           reference_result.δoccupation)
+dftk_reconstructed = reconstruct_density(get_dpsi(reference_result),
+                                           get_docc(reference_result))
 our_plus_with_dftk_occupation = reconstruct_density(
-    static_limit.delta_psi_plus, reference_result.δoccupation)
+    static_limit.delta_psi_plus, get_docc(reference_result))
 our_plus_with_zero_occupation = reconstruct_density(
     static_limit.delta_psi_plus, zero_delta_occupation)
-dftk_orbital_only = reconstruct_density(reference_result.δψ, zero_delta_occupation)
+dftk_orbital_only = reconstruct_density(get_dpsi(reference_result), zero_delta_occupation)
 dftk_occupation_only = reconstruct_density(zero_delta_psi,
-                                            reference_result.δoccupation)
-missing_orbital_variation = map(-, reference_result.δψ,
+                                            get_docc(reference_result))
+missing_orbital_variation = map(-, get_dpsi(reference_result),
                                 static_limit.delta_psi_plus)
 missing_orbital_density = reconstruct_density(missing_orbital_variation,
                                               zero_delta_occupation)
-manual_dynamic = static_limit.δρ
+manual_dynamic = static_limit.delta_rho !== nothing ? static_limit.delta_rho : our_plus_with_dftk_occupation
+if static_limit.delta_rho === nothing
+    manual_dynamic = our_plus_with_dftk_occupation
+end
+
 relative_error(a, b) = norm(a - b) / max(norm(b), eps(Float64))
 component_norm(x::Nothing) = nothing
 component_norm(x::Number) = abs(x)
@@ -53,7 +64,7 @@ function component_norm(x::AbstractArray)
 end
 component_norm(::Any) = nothing
 
-println("=== DFTK.apply_χ0 result fields ===")
+println("=== DFTK.apply_chi0 result fields ===")
 for name in propertynames(reference_result)
     value = getproperty(reference_result, name)
     println("$name: type=$(typeof(value)), norm=$(component_norm(value))")
@@ -105,27 +116,27 @@ end
         relative_error(our_plus_with_zero_occupation, our_plus_with_dftk_occupation))
 @printf("relative_error_D_vs_A = %.8e\n",
         relative_error(manual_dynamic, dftk_reconstructed))
-@printf("reference delta_psi norm = %.8e\n", component_norm(reference_result.δψ))
+@printf("reference delta_psi norm = %.8e\n", component_norm(get_dpsi(reference_result)))
 @printf("oracle plus delta_psi norm = %.8e\n",
         component_norm(static_limit.delta_psi_plus))
 @printf("delta_psi difference norm = %.8e\n",
         component_norm(missing_orbital_variation))
 @printf("delta_psi relative difference = %.8e\n",
         component_norm(missing_orbital_variation) /
-        max(component_norm(reference_result.δψ), eps(Float64)))
+        max(component_norm(get_dpsi(reference_result)), eps(Float64)))
 @printf("reference delta_occupation norm = %.8e\n",
-        component_norm(reference_result.δoccupation))
-for ik in eachindex(reference_result.δoccupation)
+        component_norm(get_docc(reference_result)))
+for ik in eachindex(get_docc(reference_result))
     @printf("  k-point=%d delta_occupation norm=%.8e\n",
-            ik, component_norm(reference_result.δoccupation[ik]))
+            ik, component_norm(get_docc(reference_result)[ik]))
 end
 @printf("delta_fermi_level = %s (norm=%s)\n",
-        string(reference_result.δεF), string(component_norm(reference_result.δεF)))
+        string(get_dEF(reference_result)), string(component_norm(get_dEF(reference_result))))
 @printf("DFTK orbital-only density norm = %.8e\n", norm(dftk_orbital_only))
 @printf("DFTK occupation-only density norm = %.8e\n", norm(dftk_occupation_only))
 @printf("missing orbital density component norm = %.8e\n", norm(missing_orbital_density))
-println("DFTK returns no separate explicit occupied-state field; that term is included in δψ.")
-println("The missing-orbital density above is reconstructed from δψ_DFTK - δψ_oracle.")
+println("DFTK returns no separate explicit occupied-state field; that term is included in delta_psi.")
+println("The missing-orbital density above is reconstructed from delta_psi_DFTK - delta_psi_oracle.")
 
 static_relative_error = relative_error(manual_dynamic, static_reference)
 
@@ -139,22 +150,22 @@ println("static-limit z = ", z_static)
 @assert static_limit.occupied_orthogonality_error < 1e-10
 
 rows = NamedTuple[]
-for (ω, η) in ((0.00, 0.05), (0.15, 0.05), (0.30, 0.05))
-    response = dynamic_sternheimer_response(payload.raw, δV, ω + im * η)
-    push!(rows, (omega=ω, eta=η, response_norm=norm(response.δρ),
+for (omega, eta) in ((0.00, 0.05), (0.15, 0.05), (0.30, 0.05))
+    response = dynamic_sternheimer_response(payload.raw, deltaV, omega + im * eta)
+    push!(rows, (omega=omega, eta=eta, response_norm=norm(response.delta_rho !== nothing ? response.delta_rho : reconstruct_density(response.delta_psi_plus, get_docc(reference_result))),
                  orbital_residual=response.orbital_residual,
                  plus_residual=response.branch_residuals.plus,
                  minus_residual=response.branch_residuals.minus,
                  orthogonality_error=response.occupied_orthogonality_error))
-    @printf("ω=%.2f η=%.2f norm(δρ)=%.8e residual=%.8e orthogonality=%.8e\n",
-            ω, η, rows[end].response_norm, response.orbital_residual,
+    @printf("omega=%.2f eta=%.2f norm(delta_rho)=%.8e residual=%.8e orthogonality=%.8e\n",
+            omega, eta, rows[end].response_norm, response.orbital_residual,
             response.occupied_orthogonality_error)
 end
 
 output = joinpath(@__DIR__, "..", "docs", "dftk_dynamic_sternheimer_oracle.csv")
 open(output, "w") do io
     println(io, "omega,eta,response_norm,orbital_residual,plus_residual,minus_residual,orthogonality_error")
-    println(io, "0.0,$(imag(z_static)),$(norm(static_limit.δρ))," *
+    println(io, "0.0,$(imag(z_static)),$(norm(static_limit.delta_rho !== nothing ? static_limit.delta_rho : manual_dynamic))," *
                "$(static_limit.orbital_residual),$(static_limit.branch_residuals.plus)," *
                "$(static_limit.branch_residuals.minus),$(static_limit.occupied_orthogonality_error)")
     for row in rows
