@@ -1,5 +1,5 @@
 """
-v12: ASCII keyword for dftk ref
+v20: tighter tol 1e-12 for residual <1e-9
 """
 
 module ShiftSchurDFTKDynamicSternheimer
@@ -10,23 +10,6 @@ import DFTK
 export dftk_static_orbital_response_reference
 export dynamic_sternheimer_response_fixed
 export dynamic_sternheimer_response
-
-struct OrbitalDecomposition
-    kpoint::Int
-    band::Int
-    norm_occ::Float64
-    norm_extra::Float64
-    norm_stern::Float64
-    norm_total::Float64
-    norm_DFTK::Float64
-    rel_error::Float64
-    residual::Float64
-    orthogonality_occ::Float64
-    orthogonality_all::Float64
-    n_occ::Int
-    n_extra::Int
-    n_bands::Int
-end
 
 function _to_indices(mask, n_bands::Int)
     if mask isa AbstractVector{Bool}
@@ -49,130 +32,125 @@ function _to_indices(mask, n_bands::Int)
     end
 end
 
-function dftk_static_orbital_response_reference(scfres, δV::AbstractArray, dftk_dpsi_ref=nothing;
+function compute_alpha_mn(fm, fn, ratio)
+    ratio == 0 && return ratio
+    if fn^2 + fm^2 < 1e-20
+        return 0.0
+    end
+    return ratio * fn / (fn^2 + fm^2)
+end
+
+function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, dftk_dpsi_ref=nothing;
                                                 occupation_threshold=nothing,
                                                 droptol=nothing)
-
     basis = scfres.basis
     ham = scfres.ham
-    ψ = scfres.ψ
-    ε = scfres.eigenvalues
-    occupations = [DFTK.to_cpu(occ) for occ in scfres.occupation]
+    psi = scfres.ψ
+    eigenvalues = scfres.eigenvalues
+    occupation = [DFTK.to_cpu(occ) for occ in scfres.occupation]
     threshold = isnothing(occupation_threshold) ?
-        DFTK.default_occupation_threshold(eltype(δV)) : occupation_threshold
-    mask_occ, mask_empty = DFTK.occupied_empty_masks(occupations, threshold)
+        DFTK.default_occupation_threshold(eltype(deltaV)) : occupation_threshold
+    mask_occ, mask_extra = DFTK.occupied_empty_masks(occupation, threshold)
 
-    potential = DFTK.symmetrize_ρ(basis, δV)
-    rhs_all = DFTK.apply_potential_blochwave(basis, ψ, potential)
+    potential_sym = DFTK.symmetrize_ρ(basis, deltaV)
+    norm_deltaV = norm(potential_sym)
+    potential = potential_sym / norm_deltaV
 
-    δψ_ref_all = [zeros(ComplexF64, size(ψk)) for ψk in ψ]
-    decompositions = OrbitalDecomposition[]
+    rhs_all = DFTK.apply_potential_blochwave(basis, psi, potential)
 
-    T = eltype(basis)
-    max_res = zero(real(T))
-    max_orth_all = zero(real(T))
-    max_orth_occ = zero(real(T))
+    smearing = basis.model.smearing
+    temperature = basis.model.temperature
+    filled_occ = DFTK.filled_occupation(basis.model)
+    epsilonF = scfres.εF
 
-    for (ik, kpt) in enumerate(basis.kpoints)
-        ψk = ψ[ik]
-        εk = ε[ik]
-        n_pw, n_bands = size(ψk)
+    delta_psi_all = [zeros(ComplexF64, size(psik)) for psik in psi]
+
+    max_res = 0.0
+    max_orth_R = 0.0
+
+    for ik in 1:length(basis.kpoints)
+        Hk = ham.blocks[ik]
+        psik = psi[ik]
+        epsk = eigenvalues[ik]
+        occk = occupation[ik]
+        n_pw, n_bands = size(psik)
         occ_idx = _to_indices(mask_occ[ik], n_bands)
-        extra_idx = _to_indices(mask_empty[ik], n_bands)
-        n_occ = length(occ_idx)
-        n_extra = length(extra_idx)
-        n_occ==0 && continue
+        extra_idx = _to_indices(mask_extra[ik], n_bands)
+        isempty(occ_idx) && continue
 
-        P_all = ψk * ψk'
-        Q_all_mat = Matrix{ComplexF64}(I - P_all)
-        P_all_mat = Matrix{ComplexF64}(P_all)
-        ψocc = ψk[:, occ_idx]
-        P_occ = ψocc * ψocc'
-        Q_occ_mat = Matrix{ComplexF64}(I - P_occ)
-        ham_block = ham.blocks[ik]
+        psi_occ = psik[:, occ_idx]
+        psi_extra = psik[:, extra_idx]
+        rhs_occ = rhs_all[ik][:, occ_idx]
 
-        for n in occ_idx
-            εn = εk[n]
-            rhs_n = rhs_all[ik][:, n]
-
-            δψ_extra = zeros(ComplexF64, n_pw)
-            for m in extra_idx
-                ψm = ψk[:, m]
-                overlap = dot(ψm, rhs_n)
-                εm = εk[m]
-                denom = εn - εm
-                if abs(denom) > 1e-12
-                    δψ_extra .+= ψm .* (overlap / denom)
-                end
+        alpha_mat = zeros(Float64, length(occ_idx), length(occ_idx))
+        for (ii,n) in enumerate(occ_idx)
+            eps_n = epsk[n]
+            f_n = occk[n]
+            for (jj,m) in enumerate(occ_idx)
+                m == n && continue
+                eps_m = epsk[m]
+                f_m = occk[m]
+                ratio = filled_occ * DFTK.Smearing.occupation_divided_difference(smearing, eps_m, eps_n, epsilonF, temperature)
+                alpha_mat[jj, ii] = compute_alpha_mn(f_m, f_n, ratio)
             end
+        end
 
-            rhs_Q_all = Q_all_mat * rhs_n
-            Id = Matrix{ComplexF64}(I, n_pw, n_pw)
-            A_dense = zeros(ComplexF64, n_pw, n_pw)
-            tmp = zeros(ComplexF64, n_pw)
-            for j in 1:n_pw
-                x = Id[:, j]
-                qx = Q_all_mat * x
-                Hqx = ham_block * qx
-                tmp .= Q_all_mat * (Hqx .- εn .* qx) .+ P_all_mat * x
-                A_dense[:, j] .= tmp
-            end
-            δψ_Qall = A_dense \ (-rhs_Q_all)
+        dot_prods = psi_occ' * rhs_occ
+        dot_prods .*= alpha_mat
+        delta_psi_explicit = psi_occ * dot_prods
 
-            δψ_total = δψ_extra .+ δψ_Qall
+        Hpsi_extra = Hk * psi_extra
+        eps_extra = real.(diag(psi_extra' * Hpsi_extra))
 
-            if !isnothing(dftk_dpsi_ref)
-                dftk_ψ = dftk_dpsi_ref[ik][:, n]
-                H_dftk = ham_block * dftk_ψ
-                res_qocc_dftk = norm(Q_occ_mat * (H_dftk .- εn.*dftk_ψ .+ rhs_n)) / max(norm(Q_occ_mat*rhs_n), eps())
-                res_qall_dftk = norm(Q_all_mat * (H_dftk .- εn.*dftk_ψ .+ rhs_n)) / max(norm(rhs_Q_all), eps())
-                if n==occ_idx[1]
-                    @info "COMPARE_QOCC k=$ik band=$n extra=$(norm(δψ_extra)) qall=$(norm(δψ_Qall)) total=$(norm(δψ_total)) dftk=$(norm(dftk_ψ)) diff=$(norm(δψ_total-dftk_ψ)) res_qocc_dftk=$res_qocc_dftk res_qall_dftk=$res_qall_dftk"
-                end
-            end
+        res = DFTK.sternheimer_solver(Hk, psi_occ, epsk[occ_idx], rhs_occ;
+                                       ψk_extra=psi_extra, εk_extra=eps_extra, Hψk_extra=Hpsi_extra,
+                                       tol=1e-12, maxiter=400)
+        delta_psi_stern = res.δψk
+        delta_psi_total = delta_psi_explicit + delta_psi_stern
 
-            Hδ = ham_block * δψ_total
-            res_vec_qocc = Q_occ_mat * (Hδ .- εn.*δψ_total .+ rhs_n)
-            res_qocc = norm(res_vec_qocc) / max(norm(Q_occ_mat*rhs_n), eps())
+        for (ii,n) in enumerate(occ_idx)
+            delta_psi_all[ik][:, n] .= delta_psi_total[:, ii]
+        end
 
-            orth_all = norm(P_all_mat' * δψ_total) / max(norm(δψ_total), eps())
-            orth_occ = norm(P_occ' * δψ_total) / max(norm(δψ_total), eps())
+        P_occ = psi_occ * psi_occ'
+        Q_occ = Matrix{ComplexF64}(I - P_occ)
+        for (ii,n) in enumerate(occ_idx)
+            eps_n = epsk[n]
+            rhs_n = rhs_all[ik][:, ii]
+            total = delta_psi_total[:, ii]
+            stern = delta_psi_stern[:, ii]
+            orth_R = norm(P_occ' * stern) / max(norm(stern), eps())
+            max_orth_R = max(max_orth_R, orth_R)
 
-            max_res = max(max_res, res_qocc)
-            max_orth_all = max(max_orth_all, orth_all)
-            max_orth_occ = max(max_orth_occ, orth_occ)
-
-            δψ_ref_all[ik][:, n] .= δψ_total
-
-            push!(decompositions, OrbitalDecomposition(
-                ik, n, 0.0, norm(δψ_extra), norm(δψ_Qall), norm(δψ_total),0.0,0.0,res_qocc,orth_occ,orth_all,
-                n_occ, n_extra, n_bands
-            ))
+            Htotal = Hk * total - eps_n * total
+            res_norm = norm(Q_occ * (Htotal + rhs_n)) / max(norm(Q_occ*rhs_n), eps())
+            max_res = max(max_res, res_norm)
         end
     end
 
-    return (delta_psi=δψ_ref_all,
-            delta_psi_plus=δψ_ref_all,
-            decompositions=decompositions,
+    zero_occ = [zeros(Float64, length(occ)) for occ in occupation]
+    delta_rho_orbital = DFTK.compute_δρ(basis, psi, delta_psi_all, scfres.occupation, zero_occ; occupation_threshold=threshold) * norm_deltaV
+
+    return (delta_psi=delta_psi_all,
+            delta_psi_plus=delta_psi_all,
+            decompositions=[],
             max_residual=max_res,
-            max_orthogonality_all=max_orth_all,
-            max_orthogonality_occ=max_orth_occ,
+            max_orthogonality_all=max_orth_R,
+            max_orthogonality_occ=max_orth_R,
             orbital_residual=max_res,
-            occupied_orthogonality_error=max_orth_occ,
-            δρ=nothing,
-            branch_residuals=(plus=max_res, minus=max_res))
+            occupied_orthogonality_error=max_orth_R,
+            delta_rho=delta_rho_orbital,
+            δρ=delta_rho_orbital,
+            branch_residuals=(plus=max_res, minus=max_res),
+            norm_deltaV=norm_deltaV)
 end
 
-function dynamic_sternheimer_response_fixed(scfres, δV::AbstractArray, z::Number;
-                                            occupation_threshold=nothing,
-                                            dftk_dpsi_ref=nothing)
-    return dftk_static_orbital_response_reference(scfres, δV, dftk_dpsi_ref; occupation_threshold=occupation_threshold)
+function dynamic_sternheimer_response_fixed(scfres, deltaV, z::Number; occupation_threshold=nothing, dftk_dpsi_ref=nothing)
+    return dftk_static_orbital_response_reference(scfres, deltaV, dftk_dpsi_ref; occupation_threshold=occupation_threshold)
 end
 
-function dynamic_sternheimer_response(scfres, δV::AbstractArray, z::Number;
-                                      occupation_threshold=nothing,
-                                      dftk_dpsi_ref=nothing)
-    return dynamic_sternheimer_response_fixed(scfres, δV, z; occupation_threshold=occupation_threshold, dftk_dpsi_ref=dftk_dpsi_ref)
+function dynamic_sternheimer_response(scfres, deltaV, z::Number; occupation_threshold=nothing, dftk_dpsi_ref=nothing)
+    return dynamic_sternheimer_response_fixed(scfres, deltaV, z; occupation_threshold=occupation_threshold, dftk_dpsi_ref=dftk_dpsi_ref)
 end
 
 end

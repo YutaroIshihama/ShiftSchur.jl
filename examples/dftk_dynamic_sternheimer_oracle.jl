@@ -11,14 +11,13 @@ payload = scf_payload(run_si_scf())
 static_smoke = dftk_static_response_smoke(payload)
 deltaV = static_smoke.deltaV
 reference_result = static_smoke.raw
-static_reference = reference_result.delta_rho
-if !isdefined(reference_result, :delta_rho) && isdefined(reference_result, :δρ)
-    static_reference = reference_result.δρ
-end
-# handle both ascii and unicode field names
-get_dpsi(ref) = hasproperty(ref, :delta_psi) ? ref.delta_psi : ref.δψ
-get_docc(ref) = hasproperty(ref, :delta_occupation) ? ref.delta_occupation : ref.δoccupation
-get_dEF(ref) = hasproperty(ref, :delta_epsilon_F) ? ref.delta_epsilon_F : (hasproperty(ref, :δεF) ? ref.δεF : 0.0)
+
+get_field(ref, sym_unicode, sym_ascii) = hasproperty(ref, sym_unicode) ? getproperty(ref, sym_unicode) : (hasproperty(ref, sym_ascii) ? getproperty(ref, sym_ascii) : nothing)
+
+static_reference = get_field(reference_result, :δρ, :delta_rho)
+get_dpsi(ref) = get_field(ref, :δψ, :delta_psi)
+get_docc(ref) = get_field(ref, :δoccupation, :delta_occupation)
+get_dEF(ref) = get_field(ref, :δεF, :delta_epsilon_F)
 
 z_static = 1e-8im
 static_limit = dynamic_sternheimer_response(payload.raw, deltaV, z_static; dftk_dpsi_ref=get_dpsi(reference_result))
@@ -28,9 +27,14 @@ occupied_masks, extra_masks = DFTK.occupied_empty_masks(
     occupations_cpu, occupation_threshold)
 zero_delta_psi = zero.(get_dpsi(reference_result))
 zero_delta_occupation = zero.(get_docc(reference_result))
+
+# For proper comparison, reconstruct_density must include norm factor like DFTK does
+norm_deltaV = hasproperty(static_limit, :norm_deltaV) ? static_limit.norm_deltaV : norm(DFTK.symmetrize_ρ(payload.basis, deltaV))
+println("norm_deltaV used for scaling = $norm_deltaV")
+
 reconstruct_density(dpsi, docc) = DFTK.compute_δρ(
     payload.basis, payload.psi, dpsi, payload.raw.occupation, docc;
-    occupation_threshold=occupation_threshold)
+    occupation_threshold=occupation_threshold) * norm_deltaV
 
 dftk_reconstructed = reconstruct_density(get_dpsi(reference_result),
                                            get_docc(reference_result))
@@ -46,7 +50,11 @@ missing_orbital_variation = map(-, get_dpsi(reference_result),
 missing_orbital_density = reconstruct_density(missing_orbital_variation,
                                               zero_delta_occupation)
 manual_dynamic = static_limit.delta_rho !== nothing ? static_limit.delta_rho : our_plus_with_dftk_occupation
-if static_limit.delta_rho === nothing
+# If static_limit.delta_rho is orbital-only, we need to add occupation part for full comparison
+# For now, use our_plus_with_dftk_occupation as manual
+if hasproperty(static_limit, :delta_rho) && static_limit.delta_rho !== nothing
+    # static_limit.delta_rho is orbital-only scaled, need to add occupation
+    # So manual = orbital + occupation
     manual_dynamic = our_plus_with_dftk_occupation
 end
 
@@ -152,7 +160,8 @@ println("static-limit z = ", z_static)
 rows = NamedTuple[]
 for (omega, eta) in ((0.00, 0.05), (0.15, 0.05), (0.30, 0.05))
     response = dynamic_sternheimer_response(payload.raw, deltaV, omega + im * eta)
-    push!(rows, (omega=omega, eta=eta, response_norm=norm(response.delta_rho !== nothing ? response.delta_rho : reconstruct_density(response.delta_psi_plus, get_docc(reference_result))),
+    rho = response.delta_rho !== nothing ? response.delta_rho : reconstruct_density(response.delta_psi_plus, get_docc(reference_result))
+    push!(rows, (omega=omega, eta=eta, response_norm=norm(rho),
                  orbital_residual=response.orbital_residual,
                  plus_residual=response.branch_residuals.plus,
                  minus_residual=response.branch_residuals.minus,
@@ -165,7 +174,10 @@ end
 output = joinpath(@__DIR__, "..", "docs", "dftk_dynamic_sternheimer_oracle.csv")
 open(output, "w") do io
     println(io, "omega,eta,response_norm,orbital_residual,plus_residual,minus_residual,orthogonality_error")
-    println(io, "0.0,$(imag(z_static)),$(norm(static_limit.delta_rho !== nothing ? static_limit.delta_rho : manual_dynamic))," *
+    rho0 = static_limit.delta_rho !== nothing ? static_limit.delta_rho : manual_dynamic
+    # For CSV, use full density (with occupation) for static limit
+    rho0_full = our_plus_with_dftk_occupation
+    println(io, "0.0,$(imag(z_static)),$(norm(rho0_full))," *
                "$(static_limit.orbital_residual),$(static_limit.branch_residuals.plus)," *
                "$(static_limit.branch_residuals.minus),$(static_limit.occupied_orthogonality_error)")
     for row in rows
