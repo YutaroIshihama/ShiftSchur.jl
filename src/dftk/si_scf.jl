@@ -1,5 +1,7 @@
 module ShiftSchurDFTKSiSCF
 using LinearAlgebra
+import DFTK
+import PseudoPotentialData
 export SiSCFConfig, run_si_scf, scf_payload
 Base.@kwdef struct SiSCFConfig
     lattice_constant_bohr::Float64 = 10.26
@@ -9,8 +11,6 @@ Base.@kwdef struct SiSCFConfig
     tol::Float64 = 1e-8
 end
 function run_si_scf(cfg::SiSCFConfig=SiSCFConfig())
-    @eval import DFTK
-    @eval import PseudoPotentialData
     a=cfg.lattice_constant_bohr
     lattice=a/2 .* [0 1 1; 1 0 1; 1 1 0]
     psp=DFTK.PseudoFamily("dojo.nc.sr.pbe.v0_4_1.standard.upf")
