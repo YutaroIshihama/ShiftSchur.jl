@@ -49,6 +49,42 @@ k-point MPI ranks, and symmetrizes the resulting density. `apply_χ0` also
 symmetrizes and normalizes its input potential, forms `δHψ` with
 `apply_potential_blochwave`, then calls `compute_δρ` (`chi0.jl:564-623`).
 
+## Static orbital-response decomposition
+
+The static orbital response in `compute_δψ!` is not just the projected
+Sternheimer solution. For occupied input bands it is the sum
+
+```math
+\delta\psi_k =
+\underbrace{\psi_{\rm occ}
+  \left[\alpha \odot (\psi_{\rm occ}^\dagger \delta H\psi_{\rm occ})\right]}
+_{\text{explicit occupied-state contribution}}
++
+\underbrace{\psi_{\rm extra}\alpha_{\rm extra}+\delta\psi_R}
+_{\text{extra-band and complement Sternheimer contribution}}.
+```
+
+The explicit matrix is formed in `chi0.jl:402-416`. For each occupied pair
+`m != n`, DFTK computes
+`ratio = filled_occ * occupation_divided_difference(...)` and
+`α[m,n] = ratio * f_n / (f_n^2 + f_m^2)`. For q=0, the diagonal `m == n` is
+skipped; its response is represented by `δoccupation`, not by this explicit
+orbital term. The expression is added to the output before the Sternheimer
+solve.
+
+The second contribution is returned by `sternheimer_solver`
+(`chi0.jl:115-218`). DFTK splits the orthogonal complement of the converged
+occupied states into the computed extra-state span and the remaining
+complement. Its Schur-complement solve returns
+`ψ_extra * α_extra + δψ_R`; projecting this result onto `ψ_extra` isolates the
+extra-band part, and subtracting that projection isolates the complement part.
+`apply_χ0_4P` selects occupied and extra bands from the occupations and calls
+`compute_δψ!` with these terms (`chi0.jl:452-510`). The static reference helper
+uses the same occupation divided-difference formula, DFTK band tolerances,
+extra-state Rayleigh-Ritz energies, and `sternheimer_solver`; the example
+reports each component and compares the complete orbital response against
+`DFTK.apply_χ0(...).δψ` before proceeding to dynamic frequencies.
+
 ## Reuse boundary for the reference oracle
 
 The oracle reuses the SCF result's `ham.blocks`, wavefunctions, eigenvalues,

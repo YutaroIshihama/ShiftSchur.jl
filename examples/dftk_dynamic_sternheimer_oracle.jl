@@ -15,6 +15,8 @@ static_reference = reference_result.δρ
 
 z_static = 1e-8im
 static_limit = dynamic_sternheimer_response(payload.raw, δV, z_static)
+static_orbital_reference = dftk_static_orbital_response_reference(
+    payload.raw, δV)
 occupation_threshold = DFTK.default_occupation_threshold(eltype(δV))
 occupations_cpu = [DFTK.to_cpu(occ) for occ in payload.raw.occupation]
 occupied_masks, extra_masks = DFTK.occupied_empty_masks(
@@ -40,6 +42,9 @@ missing_orbital_density = reconstruct_density(missing_orbital_variation,
                                               zero_delta_occupation)
 manual_dynamic = static_limit.δρ
 relative_error(a, b) = norm(a - b) / max(norm(b), eps(Float64))
+relative_orbital_error(a, b) =
+    sqrt(sum(norm(a[ik] - b[ik])^2 for ik in eachindex(a))) /
+    max(sqrt(sum(norm(bk)^2 for bk in b)), eps(Float64))
 component_norm(x::Nothing) = nothing
 component_norm(x::Number) = abs(x)
 component_norm(x::AbstractArray{<:Number}) = norm(x)
@@ -126,6 +131,26 @@ end
 @printf("missing orbital density component norm = %.8e\n", norm(missing_orbital_density))
 println("DFTK returns no separate explicit occupied-state field; that term is included in δψ.")
 println("The missing-orbital density above is reconstructed from δψ_DFTK - δψ_oracle.")
+
+static_orbital_relative_error = relative_orbital_error(
+    static_orbital_reference.delta_psi, reference_result.δψ)
+println("=== Reconstructed DFTK static orbital-response decomposition ===")
+for ik in eachindex(reference_result.δψ)
+    kpt = payload.basis.kpoints[ik]
+    dftk_δψ = reference_result.δψ[ik]
+    ref_δψ = static_orbital_reference.delta_psi[ik]
+    metrics = static_orbital_reference.per_kpoint[ik]
+    @printf("k=%d spin=%d ||δψ_DFTK||=%.8e ||δψ_ref||=%.8e rel_diff=%.8e\n",
+            ik, kpt.spin, norm(dftk_δψ), norm(ref_δψ),
+            relative_error(ref_δψ, dftk_δψ))
+    @printf("  occupied=%d extra=%d explicit=%.8e extra_contribution=%.8e complement=%.8e residual=%.8e cg_residual=%.8e\n",
+            metrics.n_occupied, metrics.n_extra, metrics.explicit_norm,
+            metrics.extra_norm, metrics.complement_norm,
+            metrics.residual, metrics.cg_residual)
+end
+@printf("complete static delta_psi relative difference = %.8e\n",
+        static_orbital_relative_error)
+@assert static_orbital_relative_error < 1e-6
 
 static_relative_error = relative_error(manual_dynamic, static_reference)
 
