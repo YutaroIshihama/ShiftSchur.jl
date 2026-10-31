@@ -8,7 +8,7 @@ using .ShiftSchurDFTKDielectricMacroSternheimer
 println("Running Si SCF...")
 payload = scf_payload(run_si_scf())
 
-omegas = 0.0:0.05:1.0
+omegas = [-0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4]
 eta = 0.05
 q_red = [0.01, 0.0, 0.0]
 

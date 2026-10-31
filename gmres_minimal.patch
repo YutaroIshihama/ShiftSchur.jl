@@ -1,0 +1,97 @@
+--- a/src/dftk/epsilon_macro_sternheimer.jl
++++ b/src/dftk/epsilon_macro_sternheimer.jl
+@@ -10,6 +10,8 @@
+ using LinearAlgebra
+ import DFTK
+ import FFTW
++using LinearMaps
++using IterativeSolvers
+ 
+ export epsilon_macro_sternheimer
+ export coefficients_to_real, real_to_coefficients
+@@ -67,27 +69,57 @@
+     return phase
+ end
+ 
+-function dense_hamiltonian_matrix(Hk, n_pw::Int)
+-    Hmat = zeros(ComplexF64, n_pw, n_pw)
+-    e = zeros(ComplexF64, n_pw)
+-    for i in 1:n_pw
+-        fill!(e, 0)
+-        e[i] = 1
+-        Hmat[:, i] .= Hk * e
++function solve_dynamic_gmres(Hk, psi_occ, eps_n, rhs_n, z::Number;
++                             reltol=1e-10, abstol=1e-12,
++                             restart=80, maxiter=400)
++    n_pw = size(psi_occ, 1)
++    n_occ = size(psi_occ, 2)
++    px = zeros(ComplexF64, n_pw)
++    qx = similar(px)
++    hqx = similar(px)
++    tmp = similar(px)
++    ptmp = similar(px)
++    coeff = zeros(ComplexF64, n_occ)
++
++    function project_P!(y, x)
++        mul!(coeff, adjoint(psi_occ), x)
++        mul!(y, psi_occ, coeff)
++        return y
+     end
+-    return Hmat
+-end
+ 
+-function solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_n, z::Number)
+-    n_pw = size(psi_occ, 1)
+-    P_occ = psi_occ * psi_occ'
+-    Q_occ = Matrix{ComplexF64}(I - P_occ)
+-    b = -Q_occ * rhs_n
+-    norm(b) < 1e-14 && return zeros(ComplexF64, n_pw)
+-    Hmat = dense_hamiltonian_matrix(Hk, n_pw)
+-    A = Q_occ * (Hmat - (eps_n + z)*I) * Q_occ
+-    x = (A + P_occ) \ b
+-    return Q_occ * x
++    function apply_A!(y, x)
++        project_P!(px, x)
++        @. qx = x - px
++        mul!(hqx, Hk, qx)
++        @. tmp = hqx - (eps_n + z) * qx
++        project_P!(ptmp, tmp)
++        @. y = tmp - ptmp + px
++        return y
++    end
++
++    project_P!(px, rhs_n)
++    b = ComplexF64.(-rhs_n .+ px)
++    bnorm = norm(b)
++    bnorm < 1e-14 && return zeros(ComplexF64, n_pw)
++
++    A = LinearMap{ComplexF64}(apply_A!, n_pw, n_pw; ismutating=true)
++    x = zeros(ComplexF64, n_pw)
++    x, history = gmres!(x, A, b;
++                        restart=min(restart, n_pw), maxiter=maxiter,
++                        reltol=reltol, abstol=abstol, log=true)
++
++    Ax = similar(x)
++    apply_A!(Ax, x)
++    relres = norm(Ax - b) / bnorm
++    project_P!(px, x)
++    ortherr = norm(px) / max(norm(x), eps(Float64))
++    target = max(reltol, abstol / bnorm)
++    relres <= 10 * target ||
++        error("dynamic GMRES failed: relres=$relres target=$target z=$z")
++    ortherr <= 1e-8 ||
++        error("dynamic GMRES left Q space: ortherr=$ortherr z=$z")
++    @debug "DYNAMIC_GMRES" z relres ortherr history
++    return x .- px
+ end
+ 
+ function epsilon_macro_sternheimer(scfres, omegas::AbstractVector;
+@@ -127,7 +159,7 @@
+                 psi_n_r = coefficients_to_real(basis, kpt, psi[ik][:, n])
+                 rhs_r = phase_q .* psi_n_r
+                 rhs_G = real_to_coefficients(basis, kpt, rhs_r)
+-                x = solve_dynamic_dense(Hk, psi_occ, epsk[n], rhs_G, z)
++                x = solve_dynamic_gmres(Hk, psi_occ, epsk[n], rhs_G, z)
+                 delta_psi_r = coefficients_to_real(basis, kpt, x)
+                 delta_rho_r .+= wk * fn .* conj.(psi_n_r) .* delta_psi_r
+             end
