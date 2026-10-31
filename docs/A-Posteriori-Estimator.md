@@ -245,6 +245,9 @@ DFT実装では `D` は対角ではなく `H_{cc}` ブロックそのもの（FF
 | 誤差保証 | 区間近似誤差の上界はあるが **Σb の実際の誤差とは乖離** | `||r_k||` は **Σb 誤差の上界** を与える (式 1.1) |
 
 論文では Fig. として `η=0.02` で `exact error vs estimator` が一致することを示せばよい。
+Al40 と Fe2MnAl の default 4 shifts / adaptive 比較は、それぞれ
+`docs/Al40_adaptive_vs_default.csv` と `docs/Fe2MnAl_adaptive_vs_default.csv`
+に各 η の基底次元 `k` と最大 residual estimate `max_err` を保存する。
 
 ---
 

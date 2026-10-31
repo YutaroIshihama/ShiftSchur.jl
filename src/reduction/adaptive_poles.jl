@@ -11,9 +11,11 @@ Returns the selected shifts and a vector of per-iteration named tuples with
 """
 function greedy_rational_shifts(M::SchurModel, ωgrid, η::Real, b;
                                 s_max::Integer = 12, rtol::Real = 1e-10,
-                                init_shifts = ComplexF64[im * η])
+                                init_shifts = ComplexF64[im * η],
+                                tol::Real = 1e-8)
     return greedy_rational_shifts_aposteriori(
-        M, ωgrid, η, b; s_max = s_max, rtol = rtol, init_shifts = init_shifts)
+        M, ωgrid, η, b; s_max = s_max, rtol = rtol,
+        init_shifts = init_shifts, tol = tol)
 end
 
 """
@@ -26,8 +28,12 @@ basis columns.
 function greedy_rational_shifts_aposteriori(M::SchurModel, ωgrid, η::Real, b;
                                             s_max::Integer = 16, rtol::Real = 1e-10,
                                             init_shifts = ComplexF64[im * η],
-                                            estimator::Symbol = :residual)
+                                            estimator::Symbol = :residual,
+                                            tol::Real = 1e-8)
     s_max >= 0 || throw(ArgumentError("s_max must be nonnegative"))
+    tol >= 0 || throw(ArgumentError("tol must be nonnegative"))
+    estimator === :residual ||
+        throw(ArgumentError("only the :residual estimator is implemented"))
     frequencies = collect(ωgrid)
     isempty(frequencies) && throw(ArgumentError("ωgrid must not be empty"))
 
@@ -41,7 +47,7 @@ function greedy_rational_shifts_aposteriori(M::SchurModel, ωgrid, η::Real, b;
         errors = ErrorEstimators.residual_norms_grid(RM, DQ, frequencies, η, b, M.B)
         max_err, worst = findmax(errors)
         push!(history, (max_err = max_err, k = size(Q, 2), est_type = estimator))
-        (max_err < 1e-8 || added == s_max) && break
+        (max_err <= tol || added == s_max) && break
 
         candidate = ComplexF64(frequencies[worst] + im * η)
         while any(abs(candidate - σ) <= 100eps(Float64) * max(1.0, abs(candidate), abs(σ))
