@@ -12,7 +12,7 @@ using IterativeSolvers
 import DFTK
 import FFTW
 
-export epsilon_macro_bothbranches, compare_sternheimer_sos
+export epsilon_macro_bothbranches, compare_sternheimer_sos, sos_band_convergence
 export coefficients_to_real, real_to_coefficients
 
 function _pw_to_real_scale(basis)
@@ -93,7 +93,8 @@ function _chi_plus_sternheimer(scfres,omega,eta,q_red,setup)
     for ik in eachindex(basis.kpoints)
         kpt=basis.kpoints[ik]; occk=occ[ik]; occ_idx=findall(>(0.1),occk)
         isempty(occ_idx) && continue
-        psi_occ=psi[ik][:,occ_idx]; Hk=scfres.ham.blocks[ik]; wk=basis.kweights[ik]
+        psi_occ=psi[ik][:,occ_idx]; Hk=scfres.ham.blocks[ik]
+        wk=basis.kweights[ik]
         for n in occ_idx
             psi_n_r=coefficients_to_real(basis,kpt,psi[ik][:,n])
             rhs_G=real_to_coefficients(basis,kpt,phase.*psi_n_r)
@@ -105,12 +106,13 @@ function _chi_plus_sternheimer(scfres,omega,eta,q_red,setup)
 end
 
 """Truncated-band SoS for the same single branch and same-k perturbation."""
-function _chi_plus_sos(scfres,omega,eta,q_red,setup)
+function _chi_plus_sos(scfres,omega,eta,q_red,setup; nempty::Union{Nothing,Int}=nothing)
     (;basis,Omega,phase)=setup
     psi=scfres.ψ; eig=scfres.eigenvalues; occ=[DFTK.to_cpu(o) for o in scfres.occupation]
     z=omega+im*eta; chi=0.0im
     for ik in eachindex(basis.kpoints)
         kpt=basis.kpoints[ik]; occk=occ[ik]; occ_idx=findall(>(0.1),occk); emp_idx=findall(<=(0.1),occk)
+        nempty === nothing || (emp_idx = emp_idx[1:min(nempty,length(emp_idx))])
         wk=basis.kweights[ik]
         for n in occ_idx
             psi_n_r=coefficients_to_real(basis,kpt,psi[ik][:,n])
@@ -148,6 +150,51 @@ function compare_sternheimer_sos(scfres,omegas::AbstractVector;eta=0.05,q_red=[0
     (;omegas=collect(omegas),eta,q_red,chi_sternheimer=chist,chi_sos=chis,
       epsilon_sternheimer=epsst,epsilon_sos=epss,relative_chi_error=relchi,
       relative_epsilon_error=releps,vc=setup.vc)
+end
+
+"""SoS convergence versus the number of empty bands, with one fixed SCF result.
+
+The Sternheimer reference is evaluated once.  SoS is then truncated to the
+lowest `nempty` empty states at each k point, avoiding repeated SCF runs.
+"""
+function sos_band_convergence(scfres, omegas::AbstractVector;
+                              eta=0.05, q_red=[0.01,0,0],
+                              nempty_list=[2,4,8,12,16,24])
+    setup=_setup(scfres,q_red)
+    occ=[DFTK.to_cpu(o) for o in scfres.occupation]
+    available=minimum(count(<=(0.1),o) for o in occ)
+    caps=sort(unique(min.(Int.(collect(nempty_list)),available)))
+    filter!(>(0),caps)
+    isempty(caps) && error("No empty bands are available in the SCF result")
+    @info "SoS empty-band convergence" available caps q_red eta
+
+    # Expensive matrix-free reference only once per +/- frequency.
+    chist=ComplexF64[]
+    for omega in omegas
+        sp=_chi_plus_sternheimer(scfres,omega,eta,q_red,setup)
+        sm=_chi_plus_sternheimer(scfres,-omega,eta,q_red,setup)
+        push!(chist,sp+conj(sm))
+    end
+    epsst=1 .- setup.vc.*chist
+
+    rows=NamedTuple[]
+    for ne in caps
+        chis=ComplexF64[]
+        for omega in omegas
+            qp=_chi_plus_sos(scfres,omega,eta,q_red,setup;nempty=ne)
+            qm=_chi_plus_sos(scfres,-omega,eta,q_red,setup;nempty=ne)
+            push!(chis,qp+conj(qm))
+        end
+        epss=1 .- setup.vc.*chis
+        chierr=[abs(a-b)/max(abs(b),eps(Float64)) for (a,b) in zip(chis,chist)]
+        epserr=[abs(a-b)/max(abs(b),eps(Float64)) for (a,b) in zip(epss,epsst)]
+        push!(rows,(nempty=ne,chi_sos=chis,epsilon_sos=epss,
+                    max_relative_chi_error=maximum(chierr),
+                    max_relative_epsilon_error=maximum(epserr),
+                    static_epsilon=epss[findfirst(iszero,omegas) === nothing ? 1 : findfirst(iszero,omegas)]))
+    end
+    (;omegas=collect(omegas),eta,q_red,available_empty_bands=available,
+      chi_sternheimer=chist,epsilon_sternheimer=epsst,rows,vc=setup.vc)
 end
 
 epsilon_macro_bothbranches(args...;kwargs...)=compare_sternheimer_sos(args...;kwargs...)
