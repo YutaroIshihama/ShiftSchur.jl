@@ -48,9 +48,11 @@ function greedy_rational_shifts_aposteriori(M::SchurModel, ωgrid, η::Real, b;
         max_err, worst = findmax(errors)
         if max_err <= tol || added == s_max
             push!(history, (max_err = max_err, k = size(Q, 2),
-                            est_type = estimator, selected_omega = nothing,
+                            est_type = estimator, n_poles = length(shifts),
+                            max_omega = frequencies[worst], selected_omega = nothing,
                             shifts = copy(shifts)))
             @info("adaptive pole iteration", added=added, max_err=max_err,
+                  n_poles=length(shifts), max_omega=frequencies[worst],
                   selected_omega=nothing, basis_dimension=size(Q, 2),
                   shifts=copy(shifts))
             break
@@ -67,23 +69,27 @@ function greedy_rational_shifts_aposteriori(M::SchurModel, ωgrid, η::Real, b;
         end
         if candidate === nothing
             push!(history, (max_err = max_err, k = size(Q, 2),
-                            est_type = estimator, selected_omega = nothing,
+                            est_type = estimator, n_poles = length(shifts),
+                            max_omega = frequencies[worst], selected_omega = nothing,
                             shifts = copy(shifts)))
             @info("adaptive pole iteration", added=added, max_err=max_err,
+                  n_poles=length(shifts), max_omega=frequencies[worst],
                   selected_omega=nothing, basis_dimension=size(Q, 2),
                   shifts=copy(shifts))
             break
         end
 
-        push!(shifts, candidate)
         selected_omega = real(candidate)
         push!(history, (max_err = max_err, k = size(Q, 2),
-                        est_type = estimator, selected_omega = selected_omega,
-                        shifts = copy(shifts)))
-        @info("adaptive pole iteration", added=added, max_err=max_err,
+                        est_type = estimator, n_poles = length(shifts),
+                        max_omega = frequencies[worst],
+                        selected_omega = selected_omega, shifts = copy(shifts)))
+        @info("adaptive pole iteration", added=added, max_err=max_err, n_poles=length(shifts),
+              max_omega=frequencies[worst],
               selected_omega=selected_omega, basis_dimension=size(Q, 2),
               shifts=copy(shifts))
 
+        push!(shifts, candidate)
         Qnew = rational_krylov_basis(M.D, M.B', shifts; rtol = rtol)
         DQ = ErrorEstimators.expand_DQ(M.D, Q, DQ, Qnew)
         Q = Qnew
