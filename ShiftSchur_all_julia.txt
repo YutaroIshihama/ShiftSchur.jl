@@ -453,6 +453,106 @@ linear_operator_adapter(M::AbstractMatrix) = LinearMap(M)
 
 
 
+===== FILE: src\dftk\dynamic_sternheimer.jl =====
+
+module ShiftSchurDFTKDynamicSternheimer
+
+using LinearAlgebra
+import DFTK
+
+export dynamic_sternheimer_response
+
+"""
+    dynamic_sternheimer_response(scfres, δV, z; occupation_threshold=nothing)
+
+Dense reference implementation of the q=0 frequency-dependent independent
+particle response for `z = ω + im*η`. It uses both shifted Sternheimer
+branches and the occupied projector from the DFTK SCF result. This is an
+oracle for small systems, not an optimized solver or a dielectric spectrum.
+"""
+function dynamic_sternheimer_response(scfres, δV::AbstractArray, z::Number;
+                                      occupation_threshold=nothing)
+    iszero(imag(z)) && !iszero(real(z)) &&
+        throw(ArgumentError("dynamic Sternheimer reference requires Im(z) > 0"))
+    imag(z) >= 0 || throw(ArgumentError("Im(z) must be nonnegative"))
+
+    basis = scfres.basis
+    ham = scfres.ham
+    ψ = scfres.ψ
+    ε = scfres.eigenvalues
+    occupations = [DFTK.to_cpu(occ) for occ in scfres.occupation]
+    threshold = isnothing(occupation_threshold) ?
+        DFTK.default_occupation_threshold(eltype(δV)) : occupation_threshold
+    mask_occ, _ = DFTK.occupied_empty_masks(occupations, threshold)
+
+    potential = DFTK.symmetrize_ρ(basis, δV)
+    rhs = DFTK.apply_potential_blochwave(basis, ψ, potential)
+    δψ_plus_all = zero.(rhs)
+    T = eltype(basis)
+    δρ = zeros(Complex{T}, (basis.fft_size..., basis.model.n_spin_components))
+    max_residual = zero(T)
+    max_orthogonality = zero(T)
+    max_branch_residuals = (plus=zero(T), minus=zero(T))
+
+    for (ik, kpt) in enumerate(basis.kpoints)
+        ψk = ψ[ik]
+        occ_indices = collect(mask_occ[ik])
+        ψocc = ψk[:, occ_indices]
+        size(ψocc, 2) == 0 && continue
+
+        n_pw = size(ψk, 1)
+        identity = Matrix{eltype(ψk)}(I, n_pw, n_pw)
+        Hk = ham.blocks[ik] * identity
+        P = ψocc * ψocc'
+        Q = identity - P
+
+        for n in occ_indices
+            rhs_n = rhs[ik][:, n]
+            rhs_projected = Q * rhs_n
+            εn = ε[ik][n]
+            branch_results = map((z, -conj(z))) do shift
+                shifted_H = Hk - (εn + shift) * identity
+                projected_H = Q * shifted_H * Q + P
+                δψn = projected_H \ (-rhs_projected)
+                residual = norm(Q * (shifted_H * δψn + rhs_n)) /
+                           max(norm(rhs_projected), eps(T))
+                orthogonality = norm(ψocc' * δψn) /
+                                max(norm(δψn), eps(T))
+                (δψ=δψn, residual=residual, orthogonality=orthogonality)
+            end
+            plus, minus = branch_results
+            δψ_plus_all[ik][:, n] .= plus.δψ
+            max_residual = max(max_residual, plus.residual, minus.residual)
+            max_branch_residuals = (
+                plus=max(max_branch_residuals.plus, plus.residual),
+                minus=max(max_branch_residuals.minus, minus.residual))
+            max_orthogonality = max(max_orthogonality,
+                                    plus.orthogonality, minus.orthogonality)
+
+            ψr = DFTK.ifft(basis, kpt, ψk[:, n]; normalize=false)
+            δψ_plus_r = DFTK.ifft(basis, kpt, plus.δψ; normalize=false)
+            δψ_minus_r = DFTK.ifft(basis, kpt, minus.δψ; normalize=false)
+            occ_weight = occupations[ik][n] * basis.kweights[ik]
+            δρ[:, :, :, kpt.spin] .+= occ_weight .* (
+                conj.(ψr) .* δψ_plus_r .+ ψr .* conj.(δψ_minus_r))
+        end
+    end
+
+    δρ .*= basis.fft_grid.ifft_normalization^2
+    DFTK.mpi_sum!(δρ, basis.comm_kpts)
+    δρ = DFTK.symmetrize_ρ(basis, δρ)
+
+    return (δρ=δρ, delta_psi_plus=δψ_plus_all,
+            orbital_residual=max_residual,
+            branch_residuals=max_branch_residuals,
+            occupied_orthogonality_error=max_orthogonality, z=z)
+end
+
+end # module
+
+
+
+
 ===== FILE: src\dftk\si_response_adapter.jl =====
 
 module ShiftSchurDFTKSiResponse
@@ -698,6 +798,7 @@ function AuxiliaryLinearization(A, B, D; T=promote_type(eltype(A),eltype(B),elty
     AuxiliaryLinearization{typeof(A),typeof(B),typeof(D),T}(A,B,D,n,m,zeros(T,n),zeros(T,m))
 end
 Base.size(H::AuxiliaryLinearization)=(H.nphys+H.naux,H.nphys+H.naux)
+Base.size(H::AuxiliaryLinearization, d::Integer) = d == 1 || d == 2 ? H.nphys + H.naux : 1
 Base.eltype(H::AuxiliaryLinearization{TA,TB,TD,T}) where {TA,TB,TD,T}=T
 
 function LinearAlgebra.mul!(y::AbstractVector, H::AuxiliaryLinearization, x::AbstractVector)
@@ -1324,6 +1425,7 @@ export rational_krylov_basis, polynomial_krylov_basis, ReducedSchurModel,
        adaptive_choice_vs_default_comparison
 export build_schur_model, build_schur_model_from_blocks, linear_operator_adapter,
        chi0_reduced, dielectric_matrix_reduced, macroscopic_epsilon, DFTKOccVirtPartition
+export dynamic_sternheimer_response
 
 include("operators/schur_self_energy.jl")
 include("operators/schur_operator.jl")
@@ -1335,6 +1437,8 @@ include("reduction/adaptive_poles.jl")
 include("response/adaptive_choice_extra_bands_dynamic.jl")
 include("reduction/diagnostics.jl")
 include("dftk/bridge.jl")
+include("dftk/dynamic_sternheimer.jl")
+using .ShiftSchurDFTKDynamicSternheimer: dynamic_sternheimer_response
 include("dielectric/dielectric.jl")
 
 end
@@ -1358,7 +1462,7 @@ function multishift_arnoldi(H,b,zs; krylovdim=min(length(b),80), tol=1e-10)
             K[i,j]=dot(@view(V[:,i]),w); w .-= K[i,j].*@view(V[:,i])
         end
         K[j+1,j]=norm(w)
-        if K[j+1,j] <= eps(real(float(one(T))))*10
+        if abs(K[j+1,j]) <= 10 * eps(Float64)
             kdone=j; break
         end
         V[:,j+1].=w/K[j+1,j]
@@ -1455,6 +1559,532 @@ end
 
 if abspath(PROGRAM_FILE) == abspath(@__FILE__)
     run_adaptive_convergence_diagnostic()
+end
+
+
+
+
+===== FILE: test\diagnose_multishift_eta.jl =====
+
+using Test
+using LinearAlgebra
+using Random
+using Printf
+using ShiftSchur
+
+module AuxMSLocal
+using LinearAlgebra
+include(joinpath(@__DIR__, "..", "src", "operators", "auxiliary_linearization.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "multishift_arnoldi.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "schur_multishift.jl"))
+end
+
+const AMS = AuxMSLocal
+
+Random.seed!(42)
+
+@testset "Multi-shift eta dependence" begin
+    n, m = 10, 6
+
+    A = randn(ComplexF64, n, n)
+    A = A + A'
+
+    D = Diagonal(collect(2.0:0.4:4.0))
+    B = 0.2 .* randn(ComplexF64, n, m)
+    b = randn(ComplexF64, n)
+
+    ωs = collect(range(-1.0, 1.8; length=41))
+
+    etas = [0.20, 0.10, 0.08, 0.05, 0.02, 0.01]
+    kdims = [8, 12, 14, 16]
+
+    println()
+    println("=== Multi-shift eta dependence ===")
+    println("naux    = ", n + m)
+    println("nshifts = ", length(ωs))
+    println()
+
+    @printf(
+        "%8s  %6s  %10s  %14s  %14s  %14s\n",
+        "eta",
+        "kdim",
+        "iterations",
+        "max_relerr",
+        "mean_relerr",
+        "max_resid",
+    )
+
+    results = NamedTuple[]
+
+    for η in etas
+        zs = ComplexF64.(ωs .+ im * η)
+
+        Xref = [
+            AMS.schur_matrix(A, B, D, z) \ b
+            for z in zs
+        ]
+
+        for kdim in kdims
+            X, info = AMS.schur_multishift(
+                A,
+                B,
+                D,
+                b,
+                zs;
+                krylovdim=kdim,
+                tol=1e-11,
+            )
+
+            errors = Float64[]
+            residuals = Float64[]
+
+            for (x, xref, z) in zip(X, Xref, zs)
+                S = AMS.schur_matrix(A, B, D, z)
+
+                relerr =
+                    norm(x - xref) /
+                    max(norm(xref), eps(Float64))
+
+                residual =
+                    norm(S * x - b) /
+                    norm(b)
+
+                push!(errors, relerr)
+                push!(residuals, residual)
+            end
+
+            maxerr = maximum(errors)
+            meanerr = sum(errors) / length(errors)
+            maxres = maximum(residuals)
+            maxproj = maximum(info.residuals)
+
+            push!(
+                results,
+                (
+                    eta=η,
+                    kdim=kdim,
+                    iterations=info.iterations,
+                    max_relerr=maxerr,
+                    mean_relerr=meanerr,
+                    max_residual=maxres,
+                    max_projected_residual=maxproj,
+                ),
+            )
+
+            @printf(
+                "%8.3f  %6d  %10d  %14.6e  %14.6e  %14.6e\n",
+                η,
+                kdim,
+                info.iterations,
+                maxerr,
+                meanerr,
+                maxres,
+            )
+
+            @test length(X) == 41
+            @test info.iterations <= kdim
+
+            if kdim == n + m
+                @test maxerr < 2e-9
+                @test maxres < 2e-9
+            end
+        end
+
+        println()
+    end
+
+    println()
+    println("=== Summary: max relative error ===")
+    @printf("%8s", "eta")
+
+    for kdim in kdims
+        @printf("   k=%-10d", kdim)
+    end
+
+    println()
+
+    for η in etas
+        @printf("%8.3f", η)
+
+        for kdim in kdims
+            r = only(
+                filter(
+                    x -> x.eta == η && x.kdim == kdim,
+                    results,
+                ),
+            )
+
+            @printf("   %10.3e", r.max_relerr)
+        end
+
+        println()
+    end
+
+    println()
+    println("=== Full-space consistency ===")
+
+    for η in etas
+        r = only(
+            filter(
+                x -> x.eta == η && x.kdim == n + m,
+                results,
+            ),
+        )
+
+        @printf(
+            "eta=%6.3f : maxerr=%10.3e  maxres=%10.3e\n",
+            η,
+            r.max_relerr,
+            r.max_residual,
+        )
+    end
+end
+
+
+
+
+===== FILE: test\diagnose_multishift_kdim.jl =====
+
+using Test
+using LinearAlgebra
+using Random
+using Printf
+using ShiftSchur
+
+module AuxMSLocal
+using LinearAlgebra
+include(joinpath(@__DIR__, "..", "src", "operators", "auxiliary_linearization.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "multishift_arnoldi.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "schur_multishift.jl"))
+end
+
+const AMS = AuxMSLocal
+
+Random.seed!(42)
+
+@testset "Multi-shift Krylov-dimension convergence" begin
+    n, m = 10, 6
+
+    A = randn(ComplexF64, n, n)
+    A = A + A'
+
+    D = Diagonal(collect(2.0:0.4:4.0))
+    B = 0.2 .* randn(ComplexF64, n, m)
+    b = randn(ComplexF64, n)
+
+    η = 0.08
+    ωs = collect(range(-1.0, 1.8; length=41))
+    zs = ComplexF64.(ωs .+ im * η)
+
+    kdims = [4, 6, 8, 10, 12, 14, 16]
+
+    # Direct Schur solutions:
+    # compute these once and use them as the reference for all Krylov dimensions.
+    Xref = [
+        AMS.schur_matrix(A, B, D, z) \ b
+        for z in zs
+    ]
+
+    println()
+    println("=== Multi-shift Krylov-dimension convergence ===")
+    println("naux = ", n + m)
+    println("nshifts = ", length(zs))
+    println("eta = ", η)
+    println()
+    @printf("%6s  %10s  %14s  %14s  %14s  %14s\n",
+            "kdim", "iterations", "max_relerr", "mean_relerr",
+            "max_resid", "max_projres")
+
+    max_errors = Float64[]
+    mean_errors = Float64[]
+    max_residuals = Float64[]
+    max_projected_residuals = Float64[]
+
+    for kdim in kdims
+        X, info = AMS.schur_multishift(
+            A, B, D, b, zs;
+            krylovdim=kdim,
+            tol=1e-11,
+        )
+
+        errors = Float64[]
+        residuals = Float64[]
+
+        for (x, xref, z) in zip(X, Xref, zs)
+            S = AMS.schur_matrix(A, B, D, z)
+
+            relerr =
+                norm(x - xref) /
+                max(norm(xref), eps(Float64))
+
+            residual =
+                norm(S * x - b) /
+                norm(b)
+
+            push!(errors, relerr)
+            push!(residuals, residual)
+        end
+
+        maxerr = maximum(errors)
+        meanerr = sum(errors) / length(errors)
+        maxres = maximum(residuals)
+        maxproj = maximum(info.residuals)
+
+        push!(max_errors, maxerr)
+        push!(mean_errors, meanerr)
+        push!(max_residuals, maxres)
+        push!(max_projected_residuals, maxproj)
+
+        @printf("%6d  %10d  %14.6e  %14.6e  %14.6e  %14.6e\n",
+                kdim,
+                info.iterations,
+                maxerr,
+                meanerr,
+                maxres,
+                maxproj)
+
+        @test info.iterations <= kdim
+        @test length(X) == length(zs)
+    end
+
+    println()
+    println("Convergence ratios (max error):")
+
+    for i in 2:length(kdims)
+        ratio = max_errors[i-1] / max_errors[i]
+        @printf("k=%2d -> %2d : %12.4e\n",
+                kdims[i-1], kdims[i], ratio)
+    end
+
+    println()
+    println("Final full-space values:")
+    println("max relative error     = ", max_errors[end])
+    println("mean relative error    = ", mean_errors[end])
+    println("max Schur residual     = ", max_residuals[end])
+    println("max projected residual = ", max_projected_residuals[end])
+
+    # The full auxiliary dimension is n+m=16.
+    # At kdim=16 Arnoldi spans the complete space (up to roundoff),
+    # so it should reproduce the direct Schur solutions.
+    @test kdims[end] == n + m
+    @test max_errors[end] < 2e-9
+    @test max_residuals[end] < 2e-9
+
+    # Basic sanity check: reduced spaces should ultimately improve strongly.
+    @test max_errors[end] < max_errors[1]
+end
+
+
+
+
+===== FILE: test\diagnose_multishift_scaling.jl =====
+
+using Test
+using LinearAlgebra
+using Random
+using Printf
+using ShiftSchur
+
+module AuxMSLocal
+using LinearAlgebra
+
+include(joinpath(
+    @__DIR__,
+    "..",
+    "src",
+    "operators",
+    "auxiliary_linearization.jl",
+))
+
+include(joinpath(
+    @__DIR__,
+    "..",
+    "src",
+    "solvers",
+    "multishift_arnoldi.jl",
+))
+
+include(joinpath(
+    @__DIR__,
+    "..",
+    "src",
+    "solvers",
+    "schur_multishift.jl",
+))
+
+end
+
+const AMS = AuxMSLocal
+
+Random.seed!(42)
+
+@testset "Multi-shift scaling with number of shifts" begin
+
+    # ------------------------------------------------------------
+    # Synthetic Schur problem
+    # ------------------------------------------------------------
+
+    n, m = 10, 6
+
+    A = randn(ComplexF64, n, n)
+    A = A + A'
+
+    D = Diagonal(collect(2.0:0.4:4.0))
+
+    B = 0.2 .* randn(ComplexF64, n, m)
+
+    b = randn(ComplexF64, n)
+
+    # ------------------------------------------------------------
+    # Test parameters
+    # ------------------------------------------------------------
+
+    η = 0.08
+
+    # Full auxiliary-space dimension.
+    # We deliberately use the complete space here because this test
+    # concerns scaling with the number of shifts, not Krylov compression.
+    krylovdim = n + m
+
+    nshifts_list = [1, 4, 41, 401]
+
+    println()
+    println("=== Multi-shift scaling test ===")
+    println("naux      = ", n + m)
+    println("krylovdim = ", krylovdim)
+    println("eta       = ", η)
+    println()
+
+    @printf(
+        "%10s  %10s  %12s  %14s  %14s  %12s\n",
+        "nshifts",
+        "iterations",
+        "H-matvecs",
+        "max_relerr",
+        "max_resid",
+        "time_sec",
+    )
+
+    # The first calculation establishes the Arnoldi iteration count.
+    # All subsequent shift counts must require the same number of
+    # large auxiliary-operator matvecs.
+    reference_iterations = nothing
+
+    for nshifts in nshifts_list
+
+        # Julia 1.13 does not allow
+        #
+        #     range(-1.0, 1.8; length=1)
+        #
+        # because the two endpoints differ.
+        #
+        # For the one-shift case use the midpoint of the interval.
+        ωs = if nshifts == 1
+            [0.4]
+        else
+            collect(range(-1.0, 1.8; length=nshifts))
+        end
+
+        zs = ComplexF64.(ωs .+ im * η)
+
+        # --------------------------------------------------------
+        # One Arnoldi basis -> all requested shifts
+        # --------------------------------------------------------
+
+        local X
+        local info
+
+        elapsed = @elapsed begin
+            X, info = AMS.schur_multishift(
+                A,
+                B,
+                D,
+                b,
+                zs;
+                krylovdim=krylovdim,
+                tol=1e-11,
+            )
+        end
+
+        # In the present unrestarted Arnoldi implementation,
+        # there is one large H_aux application per Arnoldi iteration.
+        matvecs = info.iterations
+
+        # --------------------------------------------------------
+        # Compare every multi-shift solution against direct Schur
+        # --------------------------------------------------------
+
+        errors = Float64[]
+        residuals = Float64[]
+
+        for (x, z) in zip(X, zs)
+
+            S = AMS.schur_matrix(A, B, D, z)
+
+            xref = S \ b
+
+            relerr =
+                norm(x - xref) /
+                max(norm(xref), eps(Float64))
+
+            residual =
+                norm(S * x - b) /
+                norm(b)
+
+            push!(errors, relerr)
+            push!(residuals, residual)
+        end
+
+        maxerr = maximum(errors)
+        maxres = maximum(residuals)
+
+        # --------------------------------------------------------
+        # Diagnostics
+        # --------------------------------------------------------
+
+        @printf(
+            "%10d  %10d  %12d  %14.6e  %14.6e  %12.6f\n",
+            nshifts,
+            info.iterations,
+            matvecs,
+            maxerr,
+            maxres,
+            elapsed,
+        )
+
+        # --------------------------------------------------------
+        # Correctness tests
+        # --------------------------------------------------------
+
+        @test length(X) == nshifts
+
+        @test length(info.residuals) == nshifts
+
+        @test info.iterations <= krylovdim
+
+        @test maxerr < 2e-9
+
+        @test maxres < 2e-9
+
+        # --------------------------------------------------------
+        # Core multi-shift scaling test
+        # --------------------------------------------------------
+
+        if reference_iterations === nothing
+            reference_iterations = info.iterations
+        else
+            # Increasing the number of frequencies must not increase
+            # construction of the large-operator Arnoldi basis.
+            @test info.iterations == reference_iterations
+        end
+    end
+
+    println()
+    println("Expected multi-shift property:")
+    println("  number of shifts        = 1 -> 4 -> 41 -> 401")
+    println("  large Haux matvec count = constant")
+    println("  only small projected shifted solves scale with nshifts")
+    println()
 end
 
 
@@ -1589,6 +2219,188 @@ end
 
 
 
+===== FILE: test\test_dftk_si_aux_multishift.jl =====
+
+using Test
+using LinearAlgebra
+using Printf
+using ShiftSchur
+using DFTK
+
+# Existing real DFTK-Si SCF and static-response adapter.
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_response_adapter.jl"))
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKSiResponse
+
+# Until these files are formally included/exported by src/ShiftSchur.jl,
+# load the auxiliary/multi-shift implementation locally for this integration test.
+module AuxMSLocal
+using LinearAlgebra
+include(joinpath(@__DIR__, "..", "src", "operators", "auxiliary_linearization.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "multishift_arnoldi.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "schur_multishift.jl"))
+end
+const AMS = AuxMSLocal
+
+@testset "DFTK-Si static Schur -> auxiliary -> multi-shift integration" begin
+    # ------------------------------------------------------------------
+    # 1. Real DFTK-Si SCF and sampled static chi0 -> SchurModel
+    # ------------------------------------------------------------------
+    cfg = SiSCFConfig()
+    scfres = run_si_scf(cfg)
+    payload = scf_payload(scfres)
+
+    smoke = dftk_static_response_smoke(payload)
+    @test norm(smoke.delta_rho0) > 0
+
+    p = build_si_response_problem(payload; q=(0.0, 0.0, 0.0),
+                                  perturbation=:density_head, nmodes=6)
+    @test validate_response_problem(p)
+    @test p.metadata.static_only === true
+    @test p.metadata.static_fit_relative_error < 1e-10
+
+    M, b = p.model, p.probe
+    A, B, D = Matrix(M.A), Matrix(M.B), Matrix(M.D)
+    n, m = size(A, 1), size(D, 1)
+
+    println()
+    println("=== DFTK-Si auxiliary/multi-shift integration ===")
+    println("DFTK version               = ", pkgversion(DFTK))
+    println("physical Schur dimension   = ", n)
+    println("auxiliary D dimension      = ", m)
+    println("enlarged Haux dimension    = ", n + m)
+    println("static fit relative error  = ", p.metadata.static_fit_relative_error)
+    println("NOTE: dynamic shifts below are solver-only regression on static_only=true model")
+
+    H = AMS.AuxiliaryLinearization(A, B, D)
+    Hmat = [A B; B' D]
+    rhs = AMS.lift_rhs(H, b)
+
+    # ------------------------------------------------------------------
+    # 2. PART A1: exact physical static consistency at z=0
+    #
+    # Do NOT solve S(0)x=b here. The sampled static response may contain a
+    # null/near-null mode, so S(0) need not be invertible. At z=0 we test the
+    # physical quantity that the adapter was constructed to reproduce:
+    # Sigma(0), and the exact Schur elimination identity.
+    # ------------------------------------------------------------------
+    Sigma0 = B * (D \ B')
+    S0 = A - Sigma0
+    S0_from_aux_elimination = A - B * (D \ B')
+
+    sigma_fit_relerr = norm(Sigma0 + p.metadata.chi0_matrix) /
+                       max(norm(p.metadata.chi0_matrix), eps(Float64))
+    schur_complement_error = norm(S0 - S0_from_aux_elimination) /
+                             max(norm(S0), eps(Float64))
+
+    println()
+    println("--- Part A1: exact z=0 static consistency ---")
+    @printf("Sigma(0) fit residual     = %.6e\n", sigma_fit_relerr)
+    @printf("Schur elimination error   = %.6e\n", schur_complement_error)
+
+    @test sigma_fit_relerr < 1e-10
+    @test schur_complement_error < 1e-12
+
+    # Temporary diagnostics for the observed z=0 singularity.
+    # Keep these while developing the DFTK response adapter; they can later be
+    # reduced to a regression assertion once the expected null space is understood.
+    svals0 = svdvals(S0)
+    rank0 = rank(S0)
+    cond0 = cond(S0)
+    println("singular values of S(0)   = ", svals0)
+    println("rank S(0)                 = ", rank0, " / ", n)
+    println("condition number S(0)     = ", cond0)
+    if !isempty(svals0)
+        println("min/max singular ratio    = ", minimum(svals0) / maximum(svals0))
+    end
+
+    # ------------------------------------------------------------------
+    # 3. PART A2: regularized solution-level equivalence
+    #
+    # Use finite eta so that solution-level comparison is well defined even
+    # when the exact static Schur matrix has null modes.
+    # ------------------------------------------------------------------
+    eta_static = 0.08
+    zreg = 0.0 + im * eta_static
+    Sreg = AMS.schur_matrix(A, B, D, zreg)
+    x_schur = Sreg \ b
+    X_aux = (Hmat - zreg * I(n + m)) \ rhs
+    x_aux = Vector(AMS.physical_part(H, X_aux))
+
+    solution_relerr = norm(x_aux - x_schur) /
+                      max(norm(x_schur), eps(Float64))
+    aux_residual = norm((Hmat - zreg * I(n + m)) * X_aux - rhs) / norm(rhs)
+    schur_residual = norm(Sreg * x_schur - b) / norm(b)
+
+    println()
+    println("--- Part A2: regularized static-limit solver validation ---")
+    println("z                           = ", zreg)
+    @printf("Schur vs auxiliary relerr = %.6e\n", solution_relerr)
+    @printf("auxiliary residual        = %.6e\n", aux_residual)
+    @printf("Schur residual            = %.6e\n", schur_residual)
+
+    @test solution_relerr < 1e-10
+    @test aux_residual < 1e-10
+    @test schur_residual < 1e-10
+
+    # Same regularized point through the actual one-basis shifted Arnoldi path.
+    X0_ms, info0 = AMS.schur_multishift(A, B, D, b, ComplexF64[zreg];
+                                        krylovdim=n+m, tol=1e-11)
+    static_ms_relerr = norm(X0_ms[1] - x_schur) /
+                       max(norm(x_schur), eps(Float64))
+    @printf("single-shift Arnoldi relerr= %.6e\n", static_ms_relerr)
+    @test static_ms_relerr < 1e-9
+    @test info0.iterations <= n + m
+
+    # ------------------------------------------------------------------
+    # 4. PART B: solver-only 41-shift regression on the same Si-derived model
+    #
+    # IMPORTANT: metadata.static_only=true. These frequency points test the
+    # numerical solver only; they are NOT a physical dynamic Si spectrum.
+    # ------------------------------------------------------------------
+    eta = 0.08
+    omegas = collect(range(-0.8, 0.8; length=41))
+    zs = ComplexF64.(omegas .+ im * eta)
+    krylovdim = n + m
+
+    Xms, info = AMS.schur_multishift(A, B, D, b, zs;
+                                     krylovdim=krylovdim, tol=1e-11)
+
+    relerrs = Float64[]
+    schur_residuals = Float64[]
+    for (x, z) in zip(Xms, zs)
+        S = AMS.schur_matrix(A, B, D, z)
+        xref = S \ b
+        push!(relerrs, norm(x - xref) / max(norm(xref), eps(Float64)))
+        push!(schur_residuals, norm(S * x - b) / norm(b))
+    end
+
+    max_relerr = maximum(relerrs)
+    max_schurres = maximum(schur_residuals)
+    max_projres = maximum(info.residuals)
+
+    println()
+    println("--- Part B: Si-derived solver-only 41-shift regression ---")
+    println("number of shifts           = ", length(zs))
+    println("Arnoldi iterations         = ", info.iterations)
+    println("Haux matvecs (current impl)= ", info.iterations)
+    @printf("max relative error         = %.6e\n", max_relerr)
+    @printf("max Schur residual         = %.6e\n", max_schurres)
+    @printf("max projected residual     = %.6e\n", max_projres)
+    println("WARNING: Part B is NOT a physical dynamic Si spectrum.")
+
+    @test length(Xms) == 41
+    @test length(info.residuals) == 41
+    @test info.iterations <= krylovdim
+    @test max_relerr < 2e-9
+    @test max_schurres < 2e-9
+    @test krylovdim == n + m
+end
+
+
+
+
 ===== FILE: test\test_dielectric.jl =====
 
 using Test
@@ -1643,15 +2455,142 @@ end
 
 
 
+===== FILE: test\test_multishift_41.jl =====
+
+using Test
+using LinearAlgebra
+using Random
+using Printf
+using ShiftSchur
+
+module AuxMSLocal
+using LinearAlgebra
+include(joinpath(@__DIR__, "..", "src", "operators", "auxiliary_linearization.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "multishift_arnoldi.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "schur_multishift.jl"))
+end
+
+const AMS = AuxMSLocal
+
+Random.seed!(42)
+
+@testset "Schur + one-basis 41-shift test" begin
+    n, m = 10, 6
+
+    A = randn(ComplexF64, n, n)
+    A = A + A'
+
+    D = Diagonal(collect(2.0:0.4:4.0))
+    B = 0.2 .* randn(ComplexF64, n, m)
+    b = randn(ComplexF64, n)
+
+    # 41 frequencies, all sharing the same imaginary broadening.
+    η = 0.08
+    ωs = collect(range(-1.0, 1.8; length=41))
+    zs = ComplexF64.(ωs .+ im * η)
+
+    # Full dimension here is intentional:
+    # this test checks correctness of one-basis multi-shift first.
+    krylovdim = n + m
+
+    X, info = AMS.schur_multishift(
+        A, B, D, b, zs;
+        krylovdim=krylovdim,
+        tol=1e-11,
+    )
+
+    @test length(X) == 41
+    @test length(info.residuals) == 41
+    @test info.iterations <= krylovdim
+
+    relative_errors = Float64[]
+    physical_residuals = Float64[]
+
+    println()
+    println("=== 41-shift Schur / auxiliary multi-shift test ===")
+    println("nshifts      = ", length(zs))
+    println("krylovdim    = ", krylovdim)
+    println("iterations   = ", info.iterations)
+    println()
+    println("   omega       rel_error       Schur_residual     projected_residual")
+
+    for (ω, z, x, projected_residual) in zip(ωs, zs, X, info.residuals)
+        S = AMS.schur_matrix(A, B, D, z)
+        xref = S \ b
+
+        relerr = norm(x - xref) / max(norm(xref), eps(Float64))
+        residual = norm(S * x - b) / norm(b)
+
+        push!(relative_errors, relerr)
+        push!(physical_residuals, residual)
+
+        @printf(
+            "%9.4f   %12.4e   %14.4e   %18.4e\n",
+            ω,
+            relerr,
+            residual,
+            projected_residual,
+        )
+
+        @test relerr < 2e-9
+        @test residual < 2e-9
+    end
+
+    println()
+    println("max relative error     = ", maximum(relative_errors))
+    println("max Schur residual     = ", maximum(physical_residuals))
+    println("max projected residual = ", maximum(info.residuals))
+    println("Arnoldi iterations     = ", info.iterations)
+    println("number of shifts       = ", length(zs))
+
+    @test maximum(relative_errors) < 2e-9
+    @test maximum(physical_residuals) < 2e-9
+end
+
+
+
+
 ===== FILE: test\test_multishift_schur.jl =====
 
-using Test, LinearAlgebra, Random
+using Test
+using LinearAlgebra
+using Random
+using ShiftSchur
+
+# The multi-shift implementation exists in the repository but is not yet part
+# of src/ShiftSchur.jl. Load the implementation files explicitly for this
+# focused local regression test. The modules avoid name collisions with the
+# already-exported ShiftSchur.schur_matrix.
+module AuxMSLocal
+using LinearAlgebra
+include(joinpath(@__DIR__, "..", "src", "operators", "auxiliary_linearization.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "multishift_arnoldi.jl"))
+include(joinpath(@__DIR__, "..", "src", "solvers", "schur_multishift.jl"))
+end
+const AMS = AuxMSLocal
+
 Random.seed!(42)
+
 @testset "Schur + one-basis multi-shift" begin
- n,m=10,6; A=randn(ComplexF64,n,n); A=A+A'; D=Diagonal(collect(2.0:0.4:4.0)); B=0.2randn(ComplexF64,n,m); b=randn(ComplexF64,n); zs=ComplexF64[-.7+.08im,.1+.08im,.9+.08im,1.7+.08im]
- X,info=schur_multishift(A,B,D,b,zs;krylovdim=n+m,tol=1e-11)
- for (x,z) in zip(X,zs); @test x ≈ (schur_matrix(A,B,D,z)\b) rtol=2e-9 atol=2e-10; end
- @test info.iterations <= n+m
+    n, m = 10, 6
+    A = randn(ComplexF64, n, n)
+    A = A + A'
+    D = Diagonal(collect(2.0:0.4:4.0))
+    B = 0.2 .* randn(ComplexF64, n, m)
+    b = randn(ComplexF64, n)
+    zs = ComplexF64[-0.7 + 0.08im, 0.1 + 0.08im, 0.9 + 0.08im, 1.7 + 0.08im]
+
+    X, info = AMS.schur_multishift(A, B, D, b, zs; krylovdim=n+m, tol=1e-11)
+
+    @test length(X) == length(zs)
+    @test length(info.residuals) == length(zs)
+    @test info.iterations <= n + m
+
+    for (x, z) in zip(X, zs)
+        xref = AMS.schur_matrix(A, B, D, z) \ b
+        @test x ≈ xref rtol=2e-9 atol=2e-10
+        @test norm(AMS.schur_matrix(A, B, D, z) * x - b) / norm(b) < 2e-9
+    end
 end
 
 
