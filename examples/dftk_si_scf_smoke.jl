@@ -1,0 +1,10 @@
+include(joinpath(@__DIR__,"..","src","dftk","si_scf.jl"))
+using .ShiftSchurDFTKSiSCF
+cfg=SiSCFConfig()
+println("Running DFTK Si SCF: Ecut=$(cfg.Ecut) Ha, kgrid=$(cfg.kgrid), n_bands=$(cfg.n_bands)")
+scf=run_si_scf(cfg)
+p=scf_payload(scf)
+println("SCF OK")
+println("number of k-point orbital blocks = ",length(p.psi))
+println("eigenvalue blocks = ",length(p.eigenvalues))
+println("first eigenvalues = ",p.eigenvalues[1][1:min(end,8)])
