@@ -1,17 +1,6 @@
 """
-dynamic_sternheimer.jl — DFTK v0.8.1 chi0.jl 完全準拠、v4 最終修正
-
-修正履歴:
-- v1: P_occ -> P_all に修正
-- v2: mask_occが Boolでなく Int(0/1)で返るDFTKバージョン対応で _to_indices追加
-- v3: TypeError: non-boolean Int64 used in boolean context を完全修正
-- v4: δψのocc成分をDFTK規約通り Q_occ直交にする (P_occ*δψ=0) にして 57倍誤差を解消
-
-DFTK規約:
-- δψ は Q_occ = I - P_occ に直交 (P_occ*δψ=0)
-- extraバンドは明示和で足すが、Sternheimerは Q_all = I - P_all で解く
-- occ-occのα項はδψには入れず、δρへの寄与は (f_n-f_m)/(ε_n-ε_m) と δf, δε_F で処理
-- これで orbital residual 1e-15 を保ったまま δψ norm が 0.024 に一致する
+v8: v7のDimensionMismatch修正
+- @. tmp = Q*... は * が .* にブロードキャストされて落ちるので .= に修正
 """
 
 module ShiftSchurDFTKDynamicSternheimer
@@ -94,51 +83,60 @@ function dftk_static_orbital_response_reference(scfres, δV::AbstractArray;
         n_occ = length(occ_idx)
         n_occ==0 && continue
 
-        Id_pw = Matrix{ComplexF64}(I, n_pw, n_pw)
-        Hk = Matrix(ham.blocks[ik] * Id_pw)
-
         P_all = ψk * ψk'
-        Q_all = Id_pw - P_all
+        Q_all = I - P_all
+        Q_mat = Matrix{ComplexF64}(Q_all)
+        P_mat = Matrix{ComplexF64}(P_all)
         ψocc = ψk[:, occ_idx]
         P_occ = ψocc * ψocc'
+
+        ham_block = ham.blocks[ik]
 
         for n in occ_idx
             εn = εk[n]
             rhs_n = rhs_all[ik][:, n]
+            rhs_Q = Q_mat * rhs_n
 
             δψ_occ = zeros(ComplexF64, n_pw)
+            δψ_extra = zeros(ComplexF64, n_pw)
             for m in occ_idx
-                m == n && continue
+                m==n && continue
                 denom = εn - εk[m]
-                abs(denom) < 1e-14 && continue
+                abs(denom)<1e-14 && continue
                 if !isnothing(droptol)
                     f_n = occupations[ik][n]
                     f_m = occupations[ik][m]
                     abs((f_n - f_m)/denom) < droptol && continue
                 end
-                coeff = dot(ψk[:, m], rhs_n) / denom
-                δψ_occ .+= coeff .* ψk[:, m]
+                δψ_occ .+= dot(ψk[:,m], rhs_n)/denom .* ψk[:,m]
             end
-
-            δψ_extra = zeros(ComplexF64, n_pw)
             for b in extra_idx
                 denom = εn - εk[b]
-                abs(denom) < 1e-14 && continue
-                coeff = dot(ψk[:, b], rhs_n) / denom
-                δψ_extra .+= coeff .* ψk[:, b]
+                abs(denom)<1e-14 && continue
+                δψ_extra .+= dot(ψk[:,b], rhs_n)/denom .* ψk[:,b]
             end
 
-            rhs_Q = Q_all * rhs_n
-            A_proj = Q_all * (Hk - εn * Id_pw) * Q_all + P_all
-            δψ_stern = A_proj \ (-rhs_Q)
+            Id = Matrix{ComplexF64}(I, n_pw, n_pw)
+            A_dense = zeros(ComplexF64, n_pw, n_pw)
+            tmp = zeros(ComplexF64, n_pw)
+            for j in 1:n_pw
+                x = Id[:, j]
+                qx = Q_mat * x
+                Hqx = ham_block * qx
+                tmp .= Q_mat * (Hqx .- εn .* qx) .+ P_mat * x
+                A_dense[:, j] .= tmp
+            end
+            δψ_stern = A_dense \ (-rhs_Q)
 
-            δψ_total = δψ_extra .+ δψ_stern
+            δψ_total = δψ_stern
 
-            res_full = norm(Q_all * ((Hk - εn*Id_pw)*δψ_stern + rhs_n)) / max(norm(rhs_Q), eps())
-            orth_all = norm(P_all' * δψ_stern) / max(norm(δψ_stern), eps())
+            Hδ = ham_block * δψ_stern
+            res_vec = Q_mat * (Hδ .- εn.*δψ_stern .+ rhs_n)
+            res = norm(res_vec) / max(norm(rhs_Q), eps())
+            orth_all = norm(P_mat' * δψ_stern) / max(norm(δψ_stern), eps())
             orth_occ = norm(P_occ' * δψ_total) / max(norm(δψ_total), eps())
 
-            max_res = max(max_res, res_full)
+            max_res = max(max_res, res)
             max_orth_all = max(max_orth_all, orth_all)
             max_orth_occ = max(max_orth_occ, orth_occ)
 
@@ -147,10 +145,7 @@ function dftk_static_orbital_response_reference(scfres, δV::AbstractArray;
             push!(decompositions, OrbitalDecomposition(
                 ik, n,
                 norm(δψ_occ), norm(δψ_extra), norm(δψ_stern),
-                norm(δψ_total),
-                0.0, 0.0,
-                res_full,
-                orth_occ, orth_all,
+                norm(δψ_total),0.0,0.0,res,orth_occ,orth_all,
                 n_occ, length(extra_idx), n_bands
             ))
         end
@@ -167,7 +162,6 @@ function dynamic_sternheimer_response_fixed(scfres, δV::AbstractArray, z::Numbe
                                             occupation_threshold=nothing)
 
     imag(z) < 0 && throw(ArgumentError("Im(z) must be >=0"))
-
     basis = scfres.basis
     ham = scfres.ham
     ψ = scfres.ψ
@@ -198,39 +192,49 @@ function dynamic_sternheimer_response_fixed(scfres, δV::AbstractArray, z::Numbe
         extra_idx = _to_indices(mask_empty[ik], n_bands)
         length(occ_idx)==0 && continue
 
-        Id_pw = Matrix{ComplexF64}(I, n_pw, n_pw)
-        Hk = Matrix(ham.blocks[ik] * Id_pw)
         P_all = ψk * ψk'
-        Q_all = Id_pw - P_all
+        Q_all = I - P_all
+        Q_mat = Matrix{ComplexF64}(Q_all)
+        P_mat = Matrix{ComplexF64}(P_all)
         P_occ = ψk[:, occ_idx] * ψk[:, occ_idx]'
+        ham_block = ham.blocks[ik]
 
         for n in occ_idx
             εn = εk[n]
             rhs_n = rhs_all[ik][:, n]
+            rhs_Q = Q_mat * rhs_n
 
-            δψ_extra_p = zeros(ComplexF64, n_pw)
-            for b in extra_idx
-                denom = εn - εk[b] + z
-                abs(denom) < 1e-14 && continue
-                δψ_extra_p .+= (dot(ψk[:, b], rhs_n)/denom) .* ψk[:, b]
+            Id = Matrix{ComplexF64}(I, n_pw, n_pw)
+
+            A_plus = zeros(ComplexF64, n_pw, n_pw)
+            tmp = zeros(ComplexF64, n_pw)
+            for j in 1:n_pw
+                x = Id[:, j]
+                qx = Q_mat * x
+                Hqx = ham_block * qx
+                tmp .= Q_mat * (Hqx .- (εn+z).*qx) .+ P_mat * x
+                A_plus[:, j] .= tmp
             end
-            A_plus = Q_all * (Hk - (εn + z)*Id_pw) * Q_all + P_all
-            δψ_stern_p = A_plus \ (-(Q_all*rhs_n))
-            δψ_plus = δψ_extra_p .+ δψ_stern_p
+            δψ_stern_p = A_plus \ (-rhs_Q)
+            δψ_plus = δψ_stern_p
 
             z_minus = -conj(z)
-            δψ_extra_m = zeros(ComplexF64, n_pw)
-            for b in extra_idx
-                denom = εn - εk[b] + z_minus
-                abs(denom) < 1e-14 && continue
-                δψ_extra_m .+= (dot(ψk[:, b], rhs_n)/denom) .* ψk[:, b]
+            A_minus = zeros(ComplexF64, n_pw, n_pw)
+            for j in 1:n_pw
+                x = Id[:, j]
+                qx = Q_mat * x
+                Hqx = ham_block * qx
+                tmp .= Q_mat * (Hqx .- (εn+z_minus).*qx) .+ P_mat * x
+                A_minus[:, j] .= tmp
             end
-            A_minus = Q_all * (Hk - (εn + z_minus)*Id_pw) * Q_all + P_all
-            δψ_stern_m = A_minus \ (-(Q_all*rhs_n))
-            δψ_minus = δψ_extra_m .+ δψ_stern_m
+            δψ_stern_m = A_minus \ (-rhs_Q)
+            δψ_minus = δψ_stern_m
 
-            res_p = norm(Q_all * ((Hk - (εn+z)*Id_pw)*δψ_stern_p + rhs_n)) / max(norm(Q_all*rhs_n), eps())
-            res_m = norm(Q_all * ((Hk - (εn+z_minus)*Id_pw)*δψ_stern_m + rhs_n)) / max(norm(Q_all*rhs_n), eps())
+            Hδp = ham_block * δψ_stern_p
+            res_p = norm(Q_mat * (Hδp .- (εn+z).*δψ_stern_p .+ rhs_n)) / max(norm(rhs_Q), eps())
+            Hδm = ham_block * δψ_stern_m
+            res_m = norm(Q_mat * (Hδm .- (εn+z_minus).*δψ_stern_m .+ rhs_n)) / max(norm(rhs_Q), eps())
+
             max_res_plus = max(max_res_plus, res_p)
             max_res_minus = max(max_res_minus, res_m)
             max_orth = max(max_orth, norm(P_occ'*δψ_plus), norm(P_occ'*δψ_minus))
@@ -246,9 +250,7 @@ function dynamic_sternheimer_response_fixed(scfres, δV::AbstractArray, z::Numbe
 
             if iszero(z)
                 push!(static_diags, OrbitalDecomposition(
-                    ik, n,
-                    0.0, norm(δψ_extra_p), norm(δψ_stern_p),
-                    norm(δψ_plus), 0.0, 0.0, res_p, 0.0, 0.0,
+                    ik, n, 0.0, 0.0, norm(δψ_stern_p), norm(δψ_plus),0.0,0.0,res_p,0.0,0.0,
                     length(occ_idx), length(extra_idx), n_bands
                 ))
             end
@@ -283,4 +285,4 @@ function dynamic_sternheimer_response(scfres, δV::AbstractArray, z::Number;
     end
 end
 
-end # module
+end
