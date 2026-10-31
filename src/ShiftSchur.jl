@@ -13,6 +13,7 @@ export rational_krylov_basis, polynomial_krylov_basis, ReducedSchurModel,
        adaptive_choice_vs_default_comparison
 export build_schur_model, build_schur_model_from_blocks, linear_operator_adapter,
        chi0_reduced, dielectric_matrix_reduced, macroscopic_epsilon, DFTKOccVirtPartition
+export dynamic_sternheimer_response
 
 include("operators/schur_self_energy.jl")
 include("operators/schur_operator.jl")
@@ -24,6 +25,8 @@ include("reduction/adaptive_poles.jl")
 include("response/adaptive_choice_extra_bands_dynamic.jl")
 include("reduction/diagnostics.jl")
 include("dftk/bridge.jl")
+include("dftk/dynamic_sternheimer.jl")
+using .ShiftSchurDFTKDynamicSternheimer: dynamic_sternheimer_response
 include("dielectric/dielectric.jl")
 
 end
