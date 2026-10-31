@@ -12,6 +12,7 @@ Base.@kwdef struct SiSCFConfig
     kgrid::NTuple{3,Int} = (2, 2, 2)
     n_bands::Int = 30
     tol::Float64 = 1e-6
+    use_symmetries::Bool = true
 end
 
 function run_si_scf(cfg::SiSCFConfig=SiSCFConfig())
@@ -32,7 +33,9 @@ function run_si_scf(cfg::SiSCFConfig=SiSCFConfig())
         temperature=0.01,
         smearing=Smearing.Gaussian(),
     )
-
+    if !cfg.use_symmetries
+       model = Model(model; symmetries=false)
+    end
     basis = PlaneWaveBasis(
         model;
         Ecut=cfg.Ecut,
