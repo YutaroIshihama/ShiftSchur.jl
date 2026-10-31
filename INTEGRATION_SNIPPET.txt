@@ -1,0 +1,9 @@
+# src/ShiftSchur.jl
+include("operators/auxiliary_linearization.jl")
+include("solvers/multishift_arnoldi.jl")
+include("solvers/schur_multishift.jl")
+
+# test/runtests.jl
+include("test_auxiliary_linearization.jl")
+include("test_multishift_schur.jl")
+include("test_silicon_second.jl")
