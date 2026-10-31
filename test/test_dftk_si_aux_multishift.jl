@@ -2,6 +2,7 @@ using Test
 using LinearAlgebra
 using Printf
 using ShiftSchur
+using DFTK
 
 # Existing real DFTK-Si SCF and static-response adapter.
 include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
