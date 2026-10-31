@@ -12,7 +12,7 @@ function multishift_arnoldi(H,b,zs; krylovdim=min(length(b),80), tol=1e-10)
             K[i,j]=dot(@view(V[:,i]),w); w .-= K[i,j].*@view(V[:,i])
         end
         K[j+1,j]=norm(w)
-        if K[j+1,j] <= eps(real(float(one(T))))*10
+        if abs(K[j+1,j]) <= 10 * eps(Float64)
             kdone=j; break
         end
         V[:,j+1].=w/K[j+1,j]
