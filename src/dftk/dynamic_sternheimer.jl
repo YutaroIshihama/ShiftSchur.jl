@@ -1,13 +1,11 @@
 """
-v27c: fixed LinearMap for IterativeSolvers
+v28: dense direct solve for dynamic Sternheimer, no iterative, to avoid GMRES bugs
 """
 
 module ShiftSchurDFTKDynamicSternheimer
 
 using LinearAlgebra
 import DFTK
-import IterativeSolvers
-import LinearMaps
 
 export dftk_static_orbital_response_reference
 export dynamic_sternheimer_response_fixed
@@ -34,28 +32,33 @@ function compute_alpha_mn(fm, fn, ratio)
     return ratio * fn / (fn^2 + fm^2)
 end
 
-function solve_dynamic_sternheimer(Hk, psi_occ, eps_n, rhs_n, z::Number; tol=1e-8, maxiter=100)
+function dense_hamiltonian_matrix(Hk, n_pw::Int)
+    # Build dense matrix by applying Hk to basis vectors
+    Hmat = zeros(ComplexF64, n_pw, n_pw)
+    e = zeros(ComplexF64, n_pw)
+    for i in 1:n_pw
+        fill!(e, 0); e[i]=1
+        Hmat[:,i] .= Hk * e
+    end
+    return Hmat
+end
+
+function solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_n, z::Number)
     n_pw = size(psi_occ, 1)
     P_occ = psi_occ * psi_occ'
     Q_occ = Matrix{ComplexF64}(I - P_occ)
     b = -Q_occ * rhs_n
     norm(b) < 1e-14 && return zeros(ComplexF64, n_pw)
-    # LinearMap with in-place mul! signature (y,x)
-    function mul!(y, x)
-        Qx = Q_occ * x
-        HQx = Hk * Qx
-        y .= Q_occ * (HQx - (eps_n + z) * Qx)
-        return y
-    end
-    A = LinearMaps.LinearMap{ComplexF64}(mul!, n_pw, n_pw; ismutating=true)
-    try
-        x, hist = IterativeSolvers.gmres(A, b; restart=min(30, n_pw), maxiter=maxiter, log=true, verbose=false, tol=tol)
-        x = Q_occ * x
-        return x
-    catch e
-        @warn "GMRES failed for eps=$eps_n z=$z: $e, falling back to zero"
-        return zeros(ComplexF64, n_pw)
-    end
+    # Build dense H
+    Hmat = dense_hamiltonian_matrix(Hk, n_pw)
+    A = Q_occ * (Hmat - (eps_n + z)*I) * Q_occ
+    # Regularize: solve in Q space via pinv or \ with small shift
+    # Since A has zero eigenvalues in P space, we solve for x in Q via least squares
+    # Use A + P_occ to make invertible, then project
+    A_reg = A + P_occ
+    x = A_reg \ b
+    x = Q_occ * x
+    return x
 end
 
 function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, dftk_dpsi_ref=nothing;
@@ -132,7 +135,7 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
             for (ii,n) in enumerate(occ_idx)
                 eps_n = epsk[n]
                 rhs_n = rhs_occ[:, ii]
-                x = solve_dynamic_sternheimer(Hk, psi_occ, eps_n, rhs_n, z; tol=1e-8, maxiter=80)
+                x = solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_n, z)
                 delta_psi_stern[:, ii] .= x
             end
         end
@@ -157,7 +160,7 @@ function dftk_static_orbital_response_reference(scfres, deltaV::AbstractArray, d
         end
 
         if !is_static
-            @info "DYNAMIC_GMRES k=$ik z=$z explicit=$(norm(delta_psi_explicit)) stern=$(norm(delta_psi_stern)) total=$(norm(delta_psi_total))"
+            @info "DYNAMIC_DENSE k=$ik z=$z explicit=$(norm(delta_psi_explicit)) stern=$(norm(delta_psi_stern)) total=$(norm(delta_psi_total))"
         end
     end
 
