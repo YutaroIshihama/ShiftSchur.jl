@@ -17,8 +17,11 @@ using .ShiftSchurDFTKDielectricMacroSternheimer
     Omega = abs(det(basis.model.lattice))
     dV = Omega / N
 
-    psi_r = coefficients_to_real(basis, kpt, c)
+    psi_r = build_psi_r(basis, kpt, c)
     @test sum(abs2, psi_r) * dV ≈ sum(abs2, c) rtol=2e-12 atol=2e-12
+    @test sum(abs2, psi_r) * dV ≈ 1 rtol=2e-12 atol=2e-12
+    @test build_psi_G(basis, kpt, psi_r) ≈ c rtol=2e-12 atol=2e-12
+    @test coefficients_to_real(basis, kpt, c) ≈ psi_r rtol=2e-12 atol=2e-12
     @test real_to_coefficients(basis, kpt, psi_r) ≈ c rtol=2e-12 atol=2e-12
 
     Random.seed!(20261031)

@@ -1,65 +1,46 @@
-"""
-Macroscopic epsilon_M via dynamic Sternheimer (head only).
-
-This revision removes vector-by-vector real-space renormalization.  The
-plane-wave <-> real-space transforms use one fixed normalization factor,
-so the amplitude of a Sternheimer solution is preserved.
-"""
+"""Macroscopic dielectric matrix via dynamic Sternheimer response."""
 module ShiftSchurDFTKDielectricMacroSternheimer
 
 using LinearAlgebra
 import DFTK
-import FFTW
 using LinearMaps
 using IterativeSolvers
 
 export epsilon_macro_sternheimer
 export build_G_list
 export coefficients_to_real, real_to_coefficients
+export build_psi_r, build_psi_G
 
-"""Return the fixed coefficient-to-grid scale that preserves the L2 norm.
-
-With Julia's FFT convention, `ifft` contains `1/N`.  Therefore
-
-    psi_r = ifft(grid) * sqrt(N / dV)
-
-satisfies `sum(abs2, psi_r) * dV == sum(abs2, coefficients)` up to roundoff.
-The factor depends only on the basis/grid, never on the input vector.
 """
-function _pw_to_real_scale(basis)
-    N = prod(basis.fft_size)
-    Omega = abs(det(basis.model.lattice))
-    dV = Omega / N
-    return sqrt(N / dV)
-end
+    build_psi_r(basis, kpt, psi_G)
 
-"""Map plane-wave coefficients to the FFT grid without renormalizing them."""
-function coefficients_to_real(basis, kpt, coefficients::AbstractVector)
-    fft_size = basis.fft_size
-    grid = zeros(ComplexF64, fft_size...)
-    length(coefficients) == length(kpt.G_vectors) ||
+Transform plane-wave coefficients to real space using DFTK's physically
+normalized inverse FFT. With the DFTK coefficient convention,
+`sum(abs2, psi_r) * dV == sum(abs2, psi_G)`; normalized SCF orbitals
+therefore satisfy `∫|ψ(r)|² dr = 1`. DFTK handles FFT normalization internally,
+so no manual `sqrt(N)` factor or per-orbital renormalization is needed.
+"""
+function build_psi_r(basis, kpt, psi_G::AbstractVector)
+    length(psi_G) == length(kpt.G_vectors) ||
         throw(DimensionMismatch("coefficient vector and G-vector list have different lengths"))
-    for (i, G) in enumerate(kpt.G_vectors)
-        idx = ntuple(a -> mod(Int(G[a]), fft_size[a]) + 1, 3)
-        grid[idx...] = coefficients[i]
-    end
-    return FFTW.ifft(grid) * _pw_to_real_scale(basis)
+    return DFTK.ifft(basis, kpt, psi_G)
 end
 
-"""Map an FFT-grid field back to the selected plane-wave coefficients."""
-function real_to_coefficients(basis, kpt, field_r::AbstractArray)
+"""Transform a real-space field to the k-point's plane-wave coefficients."""
+function build_psi_G(basis, kpt, field_r::AbstractArray)
     size(field_r) == Tuple(basis.fft_size) ||
         throw(DimensionMismatch("real-space field has the wrong FFT-grid shape"))
-    fft_size = basis.fft_size
-    grid = FFTW.fft(field_r) / _pw_to_real_scale(basis)
-    coefficients = zeros(ComplexF64, length(kpt.G_vectors))
-    for (i, G) in enumerate(kpt.G_vectors)
-        idx = ntuple(a -> mod(Int(G[a]), fft_size[a]) + 1, 3)
-        coefficients[i] = grid[idx...]
-    end
-    return coefficients
+    return DFTK.fft(basis, kpt, field_r)
 end
 
+# Retain the existing names as aliases for callers of this module.
+coefficients_to_real(basis, kpt, coefficients::AbstractVector) =
+    build_psi_r(basis, kpt, coefficients)
+real_to_coefficients(basis, kpt, field_r::AbstractArray) =
+    build_psi_G(basis, kpt, field_r)
+
+"""Build `exp(i q·r)` on the real-space grid, where
+`r = lattice * [ix/nx, iy/ny, iz/nz]`."""
 function build_phase_q(basis, q_red)
     nx, ny, nz = basis.fft_size
     phase = zeros(ComplexF64, nx, ny, nz)
@@ -194,7 +175,7 @@ function epsilon_macro_sternheimer(scfres, omegas::AbstractVector;
         occ_idx = findall(x -> x > 0.1, occk)
         isempty(occ_idx) && continue
         psi_occ = psi[ik][:, occ_idx]
-        psi_occ_r = [coefficients_to_real(basis, kpt, psi[ik][:, n]) for n in occ_idx]
+        psi_occ_r = [build_psi_r(basis, kpt, psi[ik][:, n]) for n in occ_idx]
         push!(kpoint_data, (kpt=kpt, Hk=ham.blocks[ik], epsk=eigenvalues[ik],
                             occk=occk, occ_idx=occ_idx, psi_occ=psi_occ,
                             psi_occ_r=psi_occ_r, wk=kweights[ik]))
@@ -211,9 +192,9 @@ function epsilon_macro_sternheimer(scfres, omegas::AbstractVector;
                     fn = data.occk[n]
                     psi_n_r = data.psi_occ_r[iocc]
                     rhs_r = phase_qGprime .* psi_n_r
-                    rhs_G = real_to_coefficients(basis, data.kpt, rhs_r)
+                    rhs_G = build_psi_G(basis, data.kpt, rhs_r)
                     x = solve_dynamic_gmres(data.Hk, data.psi_occ, data.epsk[n], rhs_G, z)
-                    delta_psi_r = coefficients_to_real(basis, data.kpt, x)
+                    delta_psi_r = build_psi_r(basis, data.kpt, x)
                     delta_rho_r_Gprime .+= data.wk * fn .* conj.(psi_n_r) .* delta_psi_r
                 end
             end
