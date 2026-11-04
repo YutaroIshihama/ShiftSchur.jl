@@ -14,6 +14,7 @@ using LinearMaps
 using IterativeSolvers
 
 export epsilon_macro_sternheimer
+export build_G_list
 export coefficients_to_real, real_to_coefficients
 
 """Return the fixed coefficient-to-grid scale that preserves the L2 norm.
@@ -67,6 +68,32 @@ function build_phase_q(basis, q_red)
             (q_red[1]*ix/nx + q_red[2]*iy/ny + q_red[3]*iz/nz))
     end
     return phase
+end
+
+function build_G_list(basis, q_red; Ecut_chi=10.0)
+    length(q_red) == 3 || throw(DimensionMismatch("q_red must have three components"))
+    Ecut_chi > 0 || throw(ArgumentError("Ecut_chi must be positive"))
+
+    q = Float64[x for x in q_red]
+    recip = 2pi * inv(basis.model.lattice)'
+    candidates = Set{NTuple{3, Int}}()
+    push!(candidates, (0, 0, 0))
+    for G in basis.kpoints[1].G_vectors
+        push!(candidates, ntuple(i -> Int(G[i]), 3))
+    end
+    for gx in -2:2, gy in -2:2, gz in -2:2
+        push!(candidates, (gx, gy, gz))
+    end
+
+    G_and_norms = Tuple{NTuple{3, Int}, Float64}[]
+    for G in candidates
+        qG_norm = norm(recip * (q .+ collect(G)))
+        (G == (0, 0, 0) || qG_norm^2 / 2 < Ecut_chi) &&
+            push!(G_and_norms, (G, qG_norm))
+    end
+    sort!(G_and_norms;
+          by=x -> (x[1] == (0, 0, 0) ? 0 : 1, x[2], x[1][1], x[1][2], x[1][3]))
+    return [Float64[G[1], G[2], G[3]] for (G, _) in Iterators.take(G_and_norms, 15)]
 end
 
 function solve_dynamic_gmres(Hk, psi_occ, eps_n, rhs_n, z::Number;
@@ -123,7 +150,9 @@ function solve_dynamic_gmres(Hk, psi_occ, eps_n, rhs_n, z::Number;
 end
 
 function epsilon_macro_sternheimer(scfres, omegas::AbstractVector;
-                                    eta=0.05, q_red=[0.01, 0, 0])
+                                    eta=0.05, q_red=[0.01, 0, 0],
+                                    Ecut_chi=10.0, nG=nothing)
+    q_red = Float64[x for x in q_red]
     basis = scfres.basis
     ham = scfres.ham
     psi = scfres.ψ
@@ -136,41 +165,76 @@ function epsilon_macro_sternheimer(scfres, omegas::AbstractVector;
     recip = 2pi * inv(basis.model.lattice)'
     q_cart = recip * q_red
     q_norm = norm(q_cart)
-    vc_q = 4pi / (q_norm^2 + 1e-12)
-    @info "Macro Sternheimer: q_red=$q_red q_norm=$q_norm vc_q=$vc_q Omega=$Omega"
-    phase_q = build_phase_q(basis, q_red)
-    phase_minus_q = conj.(phase_q)
-    epsM_list = ComplexF64[]
-    chi0_list = ComplexF64[]
+    G_list = build_G_list(basis, q_red; Ecut_chi=Ecut_chi)
+    if !isnothing(nG)
+        nG isa Integer && !(nG isa Bool) ||
+            throw(ArgumentError("nG must be a positive integer"))
+        nG > 0 || throw(ArgumentError("nG must be positive"))
+        G_list = G_list[1:min(nG, length(G_list))]
+    end
+    nG_actual = length(G_list)
+    qG_norms = [norm(recip * (q_red .+ G)) for G in G_list]
+    phase_qG_list = [build_phase_q(basis, q_red .+ G) for G in G_list]
+    phase_minus_qG_list = [conj.(phase) for phase in phase_qG_list]
+    @info "G_list size = $nG_actual, |q+G| = $qG_norms"
+    @info "Macro Sternheimer: q_red=$q_red q_norm=$q_norm Omega=$Omega"
+
+    vc_G = [4pi / (qG_norms[i]^2 + 1e-12) for i in eachindex(G_list)]
+    vc = Diagonal(vc_G)
+    chi0_mat_list = Matrix{ComplexF64}[]
+    epsilon_mat_list = Matrix{ComplexF64}[]
+    epsilon_M_LF = ComplexF64[]
+    epsilon_M_NLF = ComplexF64[]
+    chi0_00 = ComplexF64[]
+
+    kpoint_data = NamedTuple[]
+    for ik in eachindex(basis.kpoints)
+        kpt = basis.kpoints[ik]
+        occk = occupation[ik]
+        occ_idx = findall(x -> x > 0.1, occk)
+        isempty(occ_idx) && continue
+        psi_occ = psi[ik][:, occ_idx]
+        psi_occ_r = [coefficients_to_real(basis, kpt, psi[ik][:, n]) for n in occ_idx]
+        push!(kpoint_data, (kpt=kpt, Hk=ham.blocks[ik], epsk=eigenvalues[ik],
+                            occk=occk, occ_idx=occ_idx, psi_occ=psi_occ,
+                            psi_occ_r=psi_occ_r, wk=kweights[ik]))
+    end
+
     for omega in omegas
         z = omega + im*eta
-        delta_rho_r = zeros(ComplexF64, fft_size...)
-        for ik in eachindex(basis.kpoints)
-            kpt = basis.kpoints[ik]
-            Hk = ham.blocks[ik]
-            epsk = eigenvalues[ik]
-            occk = occupation[ik]
-            wk = kweights[ik]
-            occ_idx = findall(x -> x > 0.1, occk)
-            isempty(occ_idx) && continue
-            psi_occ = psi[ik][:, occ_idx]
-            for n in occ_idx
-                fn = occk[n]
-                psi_n_r = coefficients_to_real(basis, kpt, psi[ik][:, n])
-                rhs_r = phase_q .* psi_n_r
-                rhs_G = real_to_coefficients(basis, kpt, rhs_r)
-                x = solve_dynamic_gmres(Hk, psi_occ, epsk[n], rhs_G, z)
-                delta_psi_r = coefficients_to_real(basis, kpt, x)
-                delta_rho_r .+= wk * fn .* conj.(psi_n_r) .* delta_psi_r
+        chi0_mat = zeros(ComplexF64, nG_actual, nG_actual)
+        for (jGprime, Gprime) in enumerate(G_list)
+            phase_qGprime = phase_qG_list[jGprime]
+            delta_rho_r_Gprime = zeros(ComplexF64, fft_size...)
+            for data in kpoint_data
+                for (iocc, n) in enumerate(data.occ_idx)
+                    fn = data.occk[n]
+                    psi_n_r = data.psi_occ_r[iocc]
+                    rhs_r = phase_qGprime .* psi_n_r
+                    rhs_G = real_to_coefficients(basis, data.kpt, rhs_r)
+                    x = solve_dynamic_gmres(data.Hk, data.psi_occ, data.epsk[n], rhs_G, z)
+                    delta_psi_r = coefficients_to_real(basis, data.kpt, x)
+                    delta_rho_r_Gprime .+= data.wk * fn .* conj.(psi_n_r) .* delta_psi_r
+                end
+            end
+            for (iG, G) in enumerate(G_list)
+                chi0_mat[iG, jGprime] =
+                    sum(phase_minus_qG_list[iG] .* delta_rho_r_Gprime) * dV / Omega
             end
         end
-        chi0_00 = sum(phase_minus_q .* delta_rho_r) * dV / Omega
-        epsM = 1 - vc_q * chi0_00
-        push!(chi0_list, chi0_00)
-        push!(epsM_list, epsM)
-        @info "omega=$omega chi0_00=$chi0_00 epsM=$epsM"
+
+        epsilon_mat = Matrix{ComplexF64}(I, nG_actual, nG_actual) - vc * chi0_mat
+        epsilon_inv = inv(epsilon_mat)
+        push!(chi0_mat_list, chi0_mat)
+        push!(epsilon_mat_list, epsilon_mat)
+        push!(chi0_00, chi0_mat[1, 1])
+        push!(epsilon_M_LF, inv(epsilon_inv[1, 1]))
+        push!(epsilon_M_NLF, epsilon_mat[1, 1])
+        @info "omega=$omega chi0_00=$(chi0_mat[1, 1]) epsilon_M_LF=$(epsilon_M_LF[end]) epsilon_M_NLF=$(epsilon_M_NLF[end])"
     end
-    return (omegas=omegas, chi0=chi0_list, epsilon=epsM_list, vc=vc_q)
+    return (omegas=omegas, G_list=G_list, chi0_mat_list=chi0_mat_list,
+            epsilon_mat_list=epsilon_mat_list, epsilon_M_LF=epsilon_M_LF,
+            epsilon_M_NLF=epsilon_M_NLF, chi0_00=chi0_00, vc=vc)
 end
 
 end

@@ -17,12 +17,15 @@ result = epsilon_macro_sternheimer(payload.raw, omegas; eta=eta, q_red=q_red)
 
 output = joinpath(@__DIR__, "..", "docs", "epsilon_macro_sternheimer.csv")
 open(output, "w") do io
-    println(io, "omega,Re_chi0,Im_chi0,Re_epsM,Im_epsM")
+    println(io, "omega,Re_chi0_00,Im_chi0_00,Re_epsM_LF,Im_epsM_LF,Re_epsM_NLF,Im_epsM_NLF")
     for (i, omega) in enumerate(result.omegas)
-        println(io, "$omega,$(real(result.chi0[i])),$(imag(result.chi0[i])),$(real(result.epsilon[i])),$(imag(result.epsilon[i]))")
+        println(io, "$omega,$(real(result.chi0_00[i])),$(imag(result.chi0_00[i]))," *
+                "$(real(result.epsilon_M_LF[i])),$(imag(result.epsilon_M_LF[i]))," *
+                "$(real(result.epsilon_M_NLF[i])),$(imag(result.epsilon_M_NLF[i]))")
     end
 end
 println("Saved macro Sternheimer epsilon to $output")
 for (i, omega) in enumerate(result.omegas)
-    println("omega=$omega chi0=$(result.chi0[i]) epsM=$(result.epsilon[i])")
+    println("omega=$omega chi0_00=$(result.chi0_00[i]) " *
+            "epsilon_M_LF=$(result.epsilon_M_LF[i]) epsilon_M_NLF=$(result.epsilon_M_NLF[i])")
 end
