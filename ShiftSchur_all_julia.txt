@@ -1,3 +1,39 @@
+===== FILE: examples\compare_bothbranches_sos.jl =====
+
+using Printf
+using ShiftSchur
+include(joinpath(@__DIR__,"..","src","dftk","si_scf.jl"))
+include(joinpath(@__DIR__,"..","src","dftk","epsilon_macro_bothbranches.jl"))
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKDielectricMacroBothBranches
+
+println("Running Si SCF...")
+payload=scf_payload(run_si_scf())
+omegas=[0.0,0.1,0.2,0.3,0.4]
+eta=0.05
+q_red=[0.01,0.0,0.0]
+result=compare_sternheimer_sos(payload.raw,omegas;eta,q_red)
+
+output=joinpath(@__DIR__,"..","docs","epsilon_bothbranches_vs_sos.csv")
+open(output,"w") do io
+    println(io,"omega,Re_chi_stern,Im_chi_stern,Re_chi_sos,Im_chi_sos,Re_eps_stern,Im_eps_stern,Re_eps_sos,Im_eps_sos,rel_chi_err,rel_eps_err")
+    for i in eachindex(result.omegas)
+        cs=result.chi_sternheimer[i]; cq=result.chi_sos[i]
+        es=result.epsilon_sternheimer[i]; eq=result.epsilon_sos[i]
+        println(io,"$(result.omegas[i]),$(real(cs)),$(imag(cs)),$(real(cq)),$(imag(cq)),$(real(es)),$(imag(es)),$(real(eq)),$(imag(eq)),$(result.relative_chi_error[i]),$(result.relative_epsilon_error[i])")
+    end
+end
+println("omega   Re eps(St)   Im eps(St)   Re eps(SoS)  Im eps(SoS)  rel chi     rel eps")
+for i in eachindex(result.omegas)
+    es=result.epsilon_sternheimer[i]; eq=result.epsilon_sos[i]
+    @printf("%5.2f  %11.6f  %11.6f  %11.6f  %11.6f  %.3e  %.3e\n",result.omegas[i],real(es),imag(es),real(eq),imag(eq),result.relative_chi_error[i],result.relative_epsilon_error[i])
+end
+println("Saved comparison to $output")
+println("NOTE: same-k finite-q diagnostic; k->k+q is still pending.")
+
+
+
+
 ===== FILE: examples\debug_chi0_per_k.jl =====
 
 using LinearAlgebra
@@ -338,7 +374,7 @@ using .ShiftSchurDFTKDielectricMacroSternheimer
 println("Running Si SCF...")
 payload = scf_payload(run_si_scf())
 
-omegas = 0.0:0.05:1.0
+omegas = [-0.4, -0.3, -0.2, -0.1, 0.0, 0.1, 0.2, 0.3, 0.4]
 eta = 0.05
 q_red = [0.01, 0.0, 0.0]
 
@@ -347,14 +383,17 @@ result = epsilon_macro_sternheimer(payload.raw, omegas; eta=eta, q_red=q_red)
 
 output = joinpath(@__DIR__, "..", "docs", "epsilon_macro_sternheimer.csv")
 open(output, "w") do io
-    println(io, "omega,Re_chi0,Im_chi0,Re_epsM,Im_epsM")
+    println(io, "omega,Re_chi0_00,Im_chi0_00,Re_epsM_LF,Im_epsM_LF,Re_epsM_NLF,Im_epsM_NLF")
     for (i, omega) in enumerate(result.omegas)
-        println(io, "$omega,$(real(result.chi0[i])),$(imag(result.chi0[i])),$(real(result.epsilon[i])),$(imag(result.epsilon[i]))")
+        println(io, "$omega,$(real(result.chi0_00[i])),$(imag(result.chi0_00[i]))," *
+                "$(real(result.epsilon_M_LF[i])),$(imag(result.epsilon_M_LF[i]))," *
+                "$(real(result.epsilon_M_NLF[i])),$(imag(result.epsilon_M_NLF[i]))")
     end
 end
 println("Saved macro Sternheimer epsilon to $output")
 for (i, omega) in enumerate(result.omegas)
-    println("omega=$omega chi0=$(result.chi0[i]) epsM=$(result.epsilon[i])")
+    println("omega=$omega chi0_00=$(result.chi0_00[i]) " *
+            "epsilon_M_LF=$(result.epsilon_M_LF[i]) epsilon_M_NLF=$(result.epsilon_M_NLF[i])")
 end
 
 
@@ -1204,79 +1243,474 @@ end
 
 
 
-===== FILE: src\dftk\epsilon_macro_sternheimer.jl =====
+===== FILE: src\dftk\epsilon_kplusq_bothbranches.jl =====
 
+"""Mesh-compatible k -> k+q both-branch Sternheimer/SoS diagnostic.
+
+q must map every stored k point to another stored k point of the same spin,
+modulo a reciprocal lattice vector. This first implementation deliberately
+rejects arbitrary q and symmetry-reduced meshes instead of silently falling
+back to the incorrect same-k approximation.
 """
-Macroscopic epsilon_M via dynamic Sternheimer (no sum over conduction bands)
-Uses v28 dense solver for (H - eps - z) Q delta_psi = -Q deltaV psi
-deltaV = exp(i q·r), q small
-delta_rho(ω) = Σ_n f_n psi_n^* delta_psi_n(ω)  (complex)
-chi0_00(q,ω) = (1/Ω) ∫ e^{-iq·r} delta_rho(r) dr
-epsilon_00 = 1 - v_c(q) chi0_00
-epsilon_M ≈ epsilon_00 (head only, no local fields) or 1/epsilon^{-1}_00 with full matrix
-"""
-
-module ShiftSchurDFTKDielectricMacroSternheimer
-
+module ShiftSchurDFTKDielectricKplusQ
 using LinearAlgebra
+using LinearMaps
+using IterativeSolvers
+import DFTK
+import FFTW
+export compare_kplusq_sternheimer_sos, build_kplusq_map
+
+function _scale(basis)
+    N=prod(basis.fft_size); dV=abs(det(basis.model.lattice))/N; sqrt(N/dV)
+end
+function coeffs_to_real(basis,kpt,c)
+    g=zeros(ComplexF64,basis.fft_size...)
+    for (i,G) in enumerate(kpt.G_vectors)
+        idx=ntuple(a->mod(Int(G[a]),basis.fft_size[a])+1,3); g[idx...]=c[i]
+    end
+    FFTW.ifft(g)*_scale(basis)
+end
+function real_to_coeffs(basis,kpt,f)
+    g=FFTW.fft(f)/_scale(basis); c=zeros(ComplexF64,length(kpt.G_vectors))
+    for (i,G) in enumerate(kpt.G_vectors)
+        idx=ntuple(a->mod(Int(G[a]),basis.fft_size[a])+1,3); c[i]=g[idx...]
+    end
+    c
+end
+function reciprocal_phase(basis,Gwrap)
+    nx,ny,nz=basis.fft_size; p=zeros(ComplexF64,nx,ny,nz)
+    for ix in 0:nx-1,iy in 0:ny-1,iz in 0:nz-1
+        p[ix+1,iy+1,iz+1]=exp(2pi*im*(Gwrap[1]*ix/nx+Gwrap[2]*iy/ny+Gwrap[3]*iz/nz))
+    end
+    p
+end
+function _mod1center(x)
+    x-round(x)
+end
+"""Return `(target, Gwrap)` for each source k, where k+q=k_target+Gwrap."""
+function build_kplusq_map(basis,q_red;tol=1e-8)
+    kpts=basis.kpoints; result=NamedTuple[]
+    for (ik,k) in enumerate(kpts)
+        wanted=collect(k.coordinate).+q_red; found=nothing
+        for (jk,kq) in enumerate(kpts)
+            k.spin==kq.spin || continue
+            delta=wanted.-collect(kq.coordinate); Gwrap=round.(Int,delta)
+            if maximum(abs.(delta.-Gwrap))<tol
+                found=(source=ik,target=jk,Gwrap=Gwrap); break
+            end
+        end
+        found===nothing && error("q=$q_red does not map stored k[$ik]=$(collect(k.coordinate)) to a stored k point. Use a full, unreduced mesh and mesh-compatible q, e.g. q=(1/Nx,0,0).")
+        push!(result,found)
+    end
+    result
+end
+function solve_gmres(H,psi_occ,eps_n,rhs,z;reltol=1e-10,abstol=1e-12,restart=80,maxiter=400)
+    n,nocc=size(psi_occ); px=zeros(ComplexF64,n); qx=similar(px); hqx=similar(px); tmp=similar(px); ptmp=similar(px); coeff=zeros(ComplexF64,nocc)
+    function P!(y,x); mul!(coeff,adjoint(psi_occ),x); mul!(y,psi_occ,coeff); y; end
+    function A!(y,x); P!(px,x); @. qx=x-px; mul!(hqx,H,qx); @. tmp=hqx-(eps_n+z)*qx; P!(ptmp,tmp); @. y=tmp-ptmp+px; y; end
+    P!(px,rhs); b=ComplexF64.(-rhs.+px); nb=norm(b); nb<1e-14 && return zeros(ComplexF64,n)
+    A=LinearMap{ComplexF64}(A!,n,n;ismutating=true); x=zeros(ComplexF64,n)
+    x,h=gmres!(x,A,b;restart=min(restart,n),maxiter,reltol,abstol,log=true)
+    Ax=similar(x); A!(Ax,x); rr=norm(Ax-b)/nb; P!(px,x); oe=norm(px)/max(norm(x),eps(Float64)); target=max(reltol,abstol/nb)
+    rr<=10target || error("k+q GMRES failed: relres=$rr target=$target z=$z")
+    oe<=1e-8 || error("k+q GMRES left Q space: ortherr=$oe z=$z")
+    x.-px
+end
+function _setup(scfres,q)
+    basis=scfres.basis; Omega=abs(det(basis.model.lattice)); recip=2pi*inv(basis.model.lattice)'; qnorm=norm(recip*q); vc=4pi/(qnorm^2+1e-12)
+    (;basis,Omega,vc,qnorm,kmap=build_kplusq_map(basis,q))
+end
+function _rhs_at_target(setup,psi,ik,n)
+    basis=setup.basis; entry=setup.kmap[ik]; ks=basis.kpoints[ik]; kt=basis.kpoints[entry.target]
+    us=coeffs_to_real(basis,ks,psi[ik][:,n]); phase=reciprocal_phase(basis,entry.Gwrap)
+    real_to_coeffs(basis,kt,phase.*us)
+end
+function _chi_plus_stern(scfres,omega,eta,setup)
+    basis=setup.basis; psi=scfres.ψ; eig=scfres.eigenvalues; occ=[DFTK.to_cpu(o) for o in scfres.occupation]; chi=0.0im; z=omega+im*eta
+    for entry in setup.kmap
+        ik=entry.source; jk=entry.target; occn=findall(>(0.1),occ[ik]); occq=findall(>(0.1),occ[jk]); psioccq=psi[jk][:,occq]
+        for n in occn
+            rhs=_rhs_at_target(setup,psi,ik,n); x=solve_gmres(scfres.ham.blocks[jk],psioccq,eig[ik][n],rhs,z)
+            chi+=basis.kweights[ik]*occ[ik][n]*dot(rhs,x)/setup.Omega
+        end
+    end
+    chi
+end
+function _chi_plus_sos(scfres,omega,eta,setup;nempty=nothing)
+    basis=setup.basis; psi=scfres.ψ; eig=scfres.eigenvalues; occ=[DFTK.to_cpu(o) for o in scfres.occupation]; chi=0.0im; z=omega+im*eta
+    for entry in setup.kmap
+        ik=entry.source; jk=entry.target; occn=findall(>(0.1),occ[ik]); empty=findall(<=(0.1),occ[jk]); nempty===nothing || (empty=empty[1:min(nempty,length(empty))])
+        for n in occn
+            rhs=_rhs_at_target(setup,psi,ik,n)
+            for m in empty
+                M=dot(psi[jk][:,m],rhs); chi+=basis.kweights[ik]*occ[ik][n]*abs2(M)/(eig[ik][n]-eig[jk][m]+z)/setup.Omega
+            end
+        end
+    end
+    chi
+end
+function compare_kplusq_sternheimer_sos(scfres,omegas;eta=0.05,q_red=[0.5,0,0],nempty=nothing)
+    setup=_setup(scfres,q_red); @info "k->k+q comparison" q_red setup.qnorm setup.vc
+    cs=ComplexF64[]; cq=ComplexF64[]
+    for w in omegas
+        sp=_chi_plus_stern(scfres,w,eta,setup); sm=_chi_plus_stern(scfres,-w,eta,setup)
+        qp=_chi_plus_sos(scfres,w,eta,setup;nempty); qm=_chi_plus_sos(scfres,-w,eta,setup;nempty)
+        push!(cs,sp+conj(sm)); push!(cq,qp+conj(qm))
+    end
+    es=1 .-setup.vc.*cs; eq=1 .-setup.vc.*cq
+    (;omegas=collect(omegas),q_red,eta,chi_sternheimer=cs,chi_sos=cq,epsilon_sternheimer=es,epsilon_sos=eq,
+      relative_chi_error=[abs(a-b)/max(abs(b),eps()) for (a,b) in zip(cs,cq)],kmap=setup.kmap,vc=setup.vc)
+end
+end
+
+
+
+
+===== FILE: src\dftk\epsilon_macro_bothbranches.jl =====
+
+"""Head-only macroscopic dielectric response with both frequency branches.
+
+The Sternheimer and SoS paths use the same FFT normalization, perturbation,
+occupations, k-point weights, q, Coulomb kernel, and branch convention.
+The present implementation remains a same-k finite-q diagnostic; k->k+q is
+not yet implemented.
+"""
+module ShiftSchurDFTKDielectricMacroBothBranches
+using LinearAlgebra
+using LinearMaps
+using IterativeSolvers
 import DFTK
 import FFTW
 
-export epsilon_macro_sternheimer
+export epsilon_macro_bothbranches, compare_sternheimer_sos, sos_band_convergence
+export coefficients_to_real, real_to_coefficients
 
-function build_psi_r(basis, kpt, psi_G)
-    fft_size = basis.fft_size
-    nx, ny, nz = fft_size
-    grid = zeros(ComplexF64, nx, ny, nz)
-    for (i,G) in enumerate(kpt.G_vectors)
-        ix = mod(Int(G[1]), nx) + 1
-        iy = mod(Int(G[2]), ny) + 1
-        iz = mod(Int(G[3]), nz) + 1
-        grid[ix, iy, iz] = psi_G[i]
-    end
-    psi_r = FFTW.ifft(grid) * sqrt(prod(fft_size))
+function _pw_to_real_scale(basis)
+    N = prod(basis.fft_size)
     Omega = abs(det(basis.model.lattice))
-    dV = Omega / prod(fft_size)
-    norm2 = sum(abs2.(psi_r)) * dV
-    psi_r ./= sqrt(norm2)
-    return psi_r
+    dV = Omega / N
+    sqrt(N / dV)
+end
+
+function coefficients_to_real(basis, kpt, c::AbstractVector)
+    length(c) == length(kpt.G_vectors) || throw(DimensionMismatch())
+    grid = zeros(ComplexF64, basis.fft_size...)
+    for (i, G) in enumerate(kpt.G_vectors)
+        idx = ntuple(a -> mod(Int(G[a]), basis.fft_size[a]) + 1, 3)
+        grid[idx...] = c[i]
+    end
+    FFTW.ifft(grid) * _pw_to_real_scale(basis)
+end
+
+function real_to_coefficients(basis, kpt, field::AbstractArray)
+    size(field) == Tuple(basis.fft_size) || throw(DimensionMismatch())
+    grid = FFTW.fft(field) / _pw_to_real_scale(basis)
+    c = zeros(ComplexF64, length(kpt.G_vectors))
+    for (i, G) in enumerate(kpt.G_vectors)
+        idx = ntuple(a -> mod(Int(G[a]), basis.fft_size[a]) + 1, 3)
+        c[i] = grid[idx...]
+    end
+    c
 end
 
 function build_phase_q(basis, q_red)
     nx, ny, nz = basis.fft_size
     phase = zeros(ComplexF64, nx, ny, nz)
     for ix in 0:nx-1, iy in 0:ny-1, iz in 0:nz-1
-        dot = q_red[1]*ix/nx + q_red[2]*iy/ny + q_red[3]*iz/nz
-        phase[ix+1, iy+1, iz+1] = exp(2π*im * dot)
+        phase[ix+1, iy+1, iz+1] = exp(2pi*im*(q_red[1]*ix/nx + q_red[2]*iy/ny + q_red[3]*iz/nz))
+    end
+    phase
+end
+
+function solve_dynamic_gmres(Hk, psi_occ, eps_n, rhs_n, z::Number;
+                             reltol=1e-10, abstol=1e-12, restart=80, maxiter=400)
+    n_pw, n_occ = size(psi_occ)
+    px=zeros(ComplexF64,n_pw); qx=similar(px); hqx=similar(px)
+    tmp=similar(px); ptmp=similar(px); coeff=zeros(ComplexF64,n_occ)
+    function project_P!(y,x)
+        mul!(coeff,adjoint(psi_occ),x); mul!(y,psi_occ,coeff); y
+    end
+    function apply_A!(y,x)
+        project_P!(px,x); @. qx=x-px; mul!(hqx,Hk,qx)
+        @. tmp=hqx-(eps_n+z)*qx; project_P!(ptmp,tmp)
+        @. y=tmp-ptmp+px; y
+    end
+    project_P!(px,rhs_n); b=ComplexF64.(-rhs_n .+ px); bnorm=norm(b)
+    bnorm < 1e-14 && return zeros(ComplexF64,n_pw)
+    A=LinearMap{ComplexF64}(apply_A!,n_pw,n_pw;ismutating=true)
+    x=zeros(ComplexF64,n_pw)
+    x,hist=gmres!(x,A,b;restart=min(restart,n_pw),maxiter=maxiter,reltol=reltol,abstol=abstol,log=true)
+    Ax=similar(x); apply_A!(Ax,x); relres=norm(Ax-b)/bnorm
+    project_P!(px,x); ortherr=norm(px)/max(norm(x),eps(Float64)); target=max(reltol,abstol/bnorm)
+    relres <= 10target || error("GMRES failed: relres=$relres target=$target z=$z")
+    ortherr <= 1e-8 || error("GMRES left Q space: ortherr=$ortherr z=$z")
+    @debug "DYNAMIC_GMRES" z relres ortherr hist
+    x .- px
+end
+
+function _setup(scfres,q_red)
+    basis=scfres.basis; Omega=abs(det(basis.model.lattice)); dV=Omega/prod(basis.fft_size)
+    recip=2pi*inv(basis.model.lattice)'; q_cart=recip*q_red; q_norm=norm(q_cart)
+    vc=4pi/(q_norm^2+1e-12); phase=build_phase_q(basis,q_red)
+    (;basis,Omega,dV,vc,phase,phase_minus=conj.(phase),q_norm)
+end
+
+"""One resonant Sternheimer branch χ+(ω+iη)."""
+function _chi_plus_sternheimer(scfres,omega,eta,q_red,setup)
+    (;basis,Omega,dV,phase,phase_minus)=setup
+    psi=scfres.ψ; eig=scfres.eigenvalues; occ=[DFTK.to_cpu(o) for o in scfres.occupation]
+    rho=zeros(ComplexF64,basis.fft_size...); z=omega+im*eta
+    for ik in eachindex(basis.kpoints)
+        kpt=basis.kpoints[ik]; occk=occ[ik]; occ_idx=findall(>(0.1),occk)
+        isempty(occ_idx) && continue
+        psi_occ=psi[ik][:,occ_idx]; Hk=scfres.ham.blocks[ik]
+        wk=basis.kweights[ik]
+        for n in occ_idx
+            psi_n_r=coefficients_to_real(basis,kpt,psi[ik][:,n])
+            rhs_G=real_to_coefficients(basis,kpt,phase.*psi_n_r)
+            x=solve_dynamic_gmres(Hk,psi_occ,eig[ik][n],rhs_G,z)
+            rho .+= wk*occk[n].*conj.(psi_n_r).*coefficients_to_real(basis,kpt,x)
+        end
+    end
+    sum(phase_minus.*rho)*dV/Omega
+end
+
+"""Truncated-band SoS for the same single branch and same-k perturbation."""
+function _chi_plus_sos(scfres,omega,eta,q_red,setup; nempty::Union{Nothing,Int}=nothing)
+    (;basis,Omega,phase)=setup
+    psi=scfres.ψ; eig=scfres.eigenvalues; occ=[DFTK.to_cpu(o) for o in scfres.occupation]
+    z=omega+im*eta; chi=0.0im
+    for ik in eachindex(basis.kpoints)
+        kpt=basis.kpoints[ik]; occk=occ[ik]; occ_idx=findall(>(0.1),occk); emp_idx=findall(<=(0.1),occk)
+        nempty === nothing || (emp_idx = emp_idx[1:min(nempty,length(emp_idx))])
+        wk=basis.kweights[ik]
+        for n in occ_idx
+            psi_n_r=coefficients_to_real(basis,kpt,psi[ik][:,n])
+            rhs_G=real_to_coefficients(basis,kpt,phase.*psi_n_r)
+            for m in emp_idx
+                M=dot(psi[ik][:,m],rhs_G)
+                chi += wk*occk[n]*abs2(M)/(eig[ik][n]-eig[ik][m]+z)
+            end
+        end
+    end
+    chi/Omega
+end
+
+"""Return both-branch Sternheimer and matched truncated-band SoS spectra.
+
+χfull(ω)=χ+(ω)+conj(χ+(-ω)); this enforces χfull(-ω)=conj(χfull(ω))
+and Im χfull(0)=0 for the present same-k diagnostic.
+"""
+function compare_sternheimer_sos(scfres,omegas::AbstractVector;eta=0.05,q_red=[0.01,0,0])
+    setup=_setup(scfres,q_red)
+    @info "Both-branch comparison" q_red setup.q_norm setup.vc setup.Omega
+    chist=ComplexF64[]; chis=ComplexF64[]
+    for omega in omegas
+        sp=_chi_plus_sternheimer(scfres,omega,eta,q_red,setup)
+        sm=_chi_plus_sternheimer(scfres,-omega,eta,q_red,setup)
+        qp=_chi_plus_sos(scfres,omega,eta,q_red,setup)
+        qm=_chi_plus_sos(scfres,-omega,eta,q_red,setup)
+        sf=sp+conj(sm); qf=qp+conj(qm)
+        push!(chist,sf); push!(chis,qf)
+        @info "omega=$omega" chi_stern=sf chi_sos=qf eps_stern=1-setup.vc*sf eps_sos=1-setup.vc*qf
+    end
+    epsst=1 .- setup.vc.*chist; epss=1 .- setup.vc.*chis
+    relchi=[abs(a-b)/max(abs(b),eps(Float64)) for (a,b) in zip(chist,chis)]
+    releps=[abs(a-b)/max(abs(b),eps(Float64)) for (a,b) in zip(epsst,epss)]
+    (;omegas=collect(omegas),eta,q_red,chi_sternheimer=chist,chi_sos=chis,
+      epsilon_sternheimer=epsst,epsilon_sos=epss,relative_chi_error=relchi,
+      relative_epsilon_error=releps,vc=setup.vc)
+end
+
+"""SoS convergence versus the number of empty bands, with one fixed SCF result.
+
+The Sternheimer reference is evaluated once.  SoS is then truncated to the
+lowest `nempty` empty states at each k point, avoiding repeated SCF runs.
+"""
+function sos_band_convergence(scfres, omegas::AbstractVector;
+                              eta=0.05, q_red=[0.01,0,0],
+                              nempty_list=[2,4,8,12,16,24])
+    setup=_setup(scfres,q_red)
+    occ=[DFTK.to_cpu(o) for o in scfres.occupation]
+    available=minimum(count(<=(0.1),o) for o in occ)
+    caps=sort(unique(min.(Int.(collect(nempty_list)),available)))
+    filter!(>(0),caps)
+    isempty(caps) && error("No empty bands are available in the SCF result")
+    @info "SoS empty-band convergence" available caps q_red eta
+
+    # Expensive matrix-free reference only once per +/- frequency.
+    chist=ComplexF64[]
+    for omega in omegas
+        sp=_chi_plus_sternheimer(scfres,omega,eta,q_red,setup)
+        sm=_chi_plus_sternheimer(scfres,-omega,eta,q_red,setup)
+        push!(chist,sp+conj(sm))
+    end
+    epsst=1 .- setup.vc.*chist
+
+    rows=NamedTuple[]
+    for ne in caps
+        chis=ComplexF64[]
+        for omega in omegas
+            qp=_chi_plus_sos(scfres,omega,eta,q_red,setup;nempty=ne)
+            qm=_chi_plus_sos(scfres,-omega,eta,q_red,setup;nempty=ne)
+            push!(chis,qp+conj(qm))
+        end
+        epss=1 .- setup.vc.*chis
+        chierr=[abs(a-b)/max(abs(b),eps(Float64)) for (a,b) in zip(chis,chist)]
+        epserr=[abs(a-b)/max(abs(b),eps(Float64)) for (a,b) in zip(epss,epsst)]
+        push!(rows,(nempty=ne,chi_sos=chis,epsilon_sos=epss,
+                    max_relative_chi_error=maximum(chierr),
+                    max_relative_epsilon_error=maximum(epserr),
+                    static_epsilon=epss[findfirst(iszero,omegas) === nothing ? 1 : findfirst(iszero,omegas)]))
+    end
+    (;omegas=collect(omegas),eta,q_red,available_empty_bands=available,
+      chi_sternheimer=chist,epsilon_sternheimer=epsst,rows,vc=setup.vc)
+end
+
+epsilon_macro_bothbranches(args...;kwargs...)=compare_sternheimer_sos(args...;kwargs...)
+end
+
+
+
+
+===== FILE: src\dftk\epsilon_macro_sternheimer.jl =====
+
+"""Macroscopic dielectric matrix via dynamic Sternheimer response."""
+module ShiftSchurDFTKDielectricMacroSternheimer
+
+using LinearAlgebra
+import DFTK
+using LinearMaps
+using IterativeSolvers
+
+export epsilon_macro_sternheimer
+export build_G_list
+export coefficients_to_real, real_to_coefficients
+export build_psi_r, build_psi_G
+
+"""
+    build_psi_r(basis, kpt, psi_G)
+
+Transform plane-wave coefficients to real space using DFTK's physically
+normalized inverse FFT. With the DFTK coefficient convention,
+`sum(abs2, psi_r) * dV == sum(abs2, psi_G)`; normalized SCF orbitals
+therefore satisfy `∫|ψ(r)|² dr = 1`. DFTK handles FFT normalization internally,
+so no manual `sqrt(N)` factor or per-orbital renormalization is needed.
+"""
+function build_psi_r(basis, kpt, psi_G::AbstractVector)
+    length(psi_G) == length(kpt.G_vectors) ||
+        throw(DimensionMismatch("coefficient vector and G-vector list have different lengths"))
+    return DFTK.ifft(basis, kpt, psi_G)
+end
+
+"""Transform a real-space field to the k-point's plane-wave coefficients."""
+function build_psi_G(basis, kpt, field_r::AbstractArray)
+    size(field_r) == Tuple(basis.fft_size) ||
+        throw(DimensionMismatch("real-space field has the wrong FFT-grid shape"))
+    return DFTK.fft(basis, kpt, field_r)
+end
+
+# Retain the existing names as aliases for callers of this module.
+coefficients_to_real(basis, kpt, coefficients::AbstractVector) =
+    build_psi_r(basis, kpt, coefficients)
+real_to_coefficients(basis, kpt, field_r::AbstractArray) =
+    build_psi_G(basis, kpt, field_r)
+
+"""Build `exp(i q·r)` on the real-space grid, where
+`r = lattice * [ix/nx, iy/ny, iz/nz]`."""
+function build_phase_q(basis, q_red)
+    nx, ny, nz = basis.fft_size
+    phase = zeros(ComplexF64, nx, ny, nz)
+    for ix in 0:nx-1, iy in 0:ny-1, iz in 0:nz-1
+        phase[ix+1, iy+1, iz+1] = exp(2pi * im *
+            (q_red[1]*ix/nx + q_red[2]*iy/ny + q_red[3]*iz/nz))
     end
     return phase
 end
 
-function dense_hamiltonian_matrix(Hk, n_pw::Int)
-    Hmat = zeros(ComplexF64, n_pw, n_pw)
-    e = zeros(ComplexF64, n_pw)
-    for i in 1:n_pw
-        fill!(e, 0); e[i]=1
-        Hmat[:,i] .= Hk * e
+function build_G_list(basis, q_red; Ecut_chi=10.0)
+    length(q_red) == 3 || throw(DimensionMismatch("q_red must have three components"))
+    Ecut_chi > 0 || throw(ArgumentError("Ecut_chi must be positive"))
+
+    q = Float64[x for x in q_red]
+    recip = 2pi * inv(basis.model.lattice)'
+    candidates = Set{NTuple{3, Int}}()
+    push!(candidates, (0, 0, 0))
+    for G in basis.kpoints[1].G_vectors
+        push!(candidates, ntuple(i -> Int(G[i]), 3))
     end
-    return Hmat
+    for gx in -2:2, gy in -2:2, gz in -2:2
+        push!(candidates, (gx, gy, gz))
+    end
+
+    G_and_norms = Tuple{NTuple{3, Int}, Float64}[]
+    for G in candidates
+        qG_norm = norm(recip * (q .+ collect(G)))
+        (G == (0, 0, 0) || qG_norm^2 / 2 < Ecut_chi) &&
+            push!(G_and_norms, (G, qG_norm))
+    end
+    sort!(G_and_norms;
+          by=x -> (x[1] == (0, 0, 0) ? 0 : 1, x[2], x[1][1], x[1][2], x[1][3]))
+    return [Float64[G[1], G[2], G[3]] for (G, _) in Iterators.take(G_and_norms, 15)]
 end
 
-function solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_n, z::Number)
+function solve_dynamic_gmres(Hk, psi_occ, eps_n, rhs_n, z::Number;
+                             reltol=1e-10, abstol=1e-12,
+                             restart=80, maxiter=400)
     n_pw = size(psi_occ, 1)
-    P_occ = psi_occ * psi_occ'
-    Q_occ = Matrix{ComplexF64}(I - P_occ)
-    b = -Q_occ * rhs_n
-    norm(b) < 1e-14 && return zeros(ComplexF64, n_pw)
-    Hmat = dense_hamiltonian_matrix(Hk, n_pw)
-    A = Q_occ * (Hmat - (eps_n + z)*I) * Q_occ
-    A_reg = A + P_occ
-    x = A_reg \ b
-    x = Q_occ * x
-    return x
+    n_occ = size(psi_occ, 2)
+    px = zeros(ComplexF64, n_pw)
+    qx = similar(px)
+    hqx = similar(px)
+    tmp = similar(px)
+    ptmp = similar(px)
+    coeff = zeros(ComplexF64, n_occ)
+
+    function project_P!(y, x)
+        mul!(coeff, adjoint(psi_occ), x)
+        mul!(y, psi_occ, coeff)
+        return y
+    end
+
+    function apply_A!(y, x)
+        project_P!(px, x)
+        @. qx = x - px
+        mul!(hqx, Hk, qx)
+        @. tmp = hqx - (eps_n + z) * qx
+        project_P!(ptmp, tmp)
+        @. y = tmp - ptmp + px
+        return y
+    end
+
+    project_P!(px, rhs_n)
+    b = ComplexF64.(-rhs_n .+ px)
+    bnorm = norm(b)
+    bnorm < 1e-14 && return zeros(ComplexF64, n_pw)
+
+    A = LinearMap{ComplexF64}(apply_A!, n_pw, n_pw; ismutating=true)
+    x = zeros(ComplexF64, n_pw)
+    x, history = gmres!(x, A, b;
+                        restart=min(restart, n_pw), maxiter=maxiter,
+                        reltol=reltol, abstol=abstol, log=true)
+
+    Ax = similar(x)
+    apply_A!(Ax, x)
+    relres = norm(Ax - b) / bnorm
+    project_P!(px, x)
+    ortherr = norm(px) / max(norm(x), eps(Float64))
+    target = max(reltol, abstol / bnorm)
+    relres <= 10 * target ||
+        error("dynamic GMRES failed: relres=$relres target=$target z=$z")
+    ortherr <= 1e-8 ||
+        error("dynamic GMRES left Q space: ortherr=$ortherr z=$z")
+    @debug "DYNAMIC_GMRES" z relres ortherr history
+    return x .- px
 end
 
-function epsilon_macro_sternheimer(scfres, omegas::AbstractVector; eta=0.05, q_red=[0.01,0,0])
+function epsilon_macro_sternheimer(scfres, omegas::AbstractVector;
+                                    eta=0.05, q_red=[0.01, 0, 0],
+                                    Ecut_chi=10.0, nG=nothing)
+    q_red = Float64[x for x in q_red]
     basis = scfres.basis
     ham = scfres.ham
     psi = scfres.ψ
@@ -1286,85 +1720,79 @@ function epsilon_macro_sternheimer(scfres, omegas::AbstractVector; eta=0.05, q_r
     Omega = abs(det(basis.model.lattice))
     fft_size = basis.fft_size
     dV = Omega / prod(fft_size)
-
-    lattice = basis.model.lattice
-    recip = 2π * inv(lattice)'
+    recip = 2pi * inv(basis.model.lattice)'
     q_cart = recip * q_red
     q_norm = norm(q_cart)
-    vc_q = 4π / (q_norm^2 + 1e-12)
-    @info "Macro Sternheimer: q_red=$q_red q_norm=$q_norm vc_q=$vc_q Omega=$Omega"
+    G_list = build_G_list(basis, q_red; Ecut_chi=Ecut_chi)
+    if !isnothing(nG)
+        nG isa Integer && !(nG isa Bool) ||
+            throw(ArgumentError("nG must be a positive integer"))
+        nG > 0 || throw(ArgumentError("nG must be positive"))
+        G_list = G_list[1:min(nG, length(G_list))]
+    end
+    nG_actual = length(G_list)
+    qG_norms = [norm(recip * (q_red .+ G)) for G in G_list]
+    phase_qG_list = [build_phase_q(basis, q_red .+ G) for G in G_list]
+    phase_minus_qG_list = [conj.(phase) for phase in phase_qG_list]
+    @info "G_list size = $nG_actual, |q+G| = $qG_norms"
+    @info "Macro Sternheimer: q_red=$q_red q_norm=$q_norm Omega=$Omega"
 
-    phase_q = build_phase_q(basis, q_red)
-    phase_minus_q = conj.(phase_q)
+    vc_G = [4pi / (qG_norms[i]^2 + 1e-12) for i in eachindex(G_list)]
+    vc = Diagonal(vc_G)
+    chi0_mat_list = Matrix{ComplexF64}[]
+    epsilon_mat_list = Matrix{ComplexF64}[]
+    epsilon_M_LF = ComplexF64[]
+    epsilon_M_NLF = ComplexF64[]
+    chi0_00 = ComplexF64[]
 
-    epsM_list = ComplexF64[]
-    chi0_list = ComplexF64[]
+    kpoint_data = NamedTuple[]
+    for ik in eachindex(basis.kpoints)
+        kpt = basis.kpoints[ik]
+        occk = occupation[ik]
+        occ_idx = findall(x -> x > 0.1, occk)
+        isempty(occ_idx) && continue
+        psi_occ = psi[ik][:, occ_idx]
+        psi_occ_r = [build_psi_r(basis, kpt, psi[ik][:, n]) for n in occ_idx]
+        push!(kpoint_data, (kpt=kpt, Hk=ham.blocks[ik], epsk=eigenvalues[ik],
+                            occk=occk, occ_idx=occ_idx, psi_occ=psi_occ,
+                            psi_occ_r=psi_occ_r, wk=kweights[ik]))
+    end
 
     for omega in omegas
         z = omega + im*eta
-        # delta_rho accumulated over kpoints, on real grid
-        delta_rho_r = zeros(ComplexF64, fft_size...)
-
-        for ik in 1:length(basis.kpoints)
-            kpt = basis.kpoints[ik]
-            Hk = ham.blocks[ik]
-            n_pw = size(psi[ik],1)
-            n_bands = size(psi[ik],2)
-            epsk = eigenvalues[ik]
-            occk = occupation[ik]
-            wk = kweights[ik]
-
-            # Determine occupied indices (simple threshold)
-            occ_idx = findall(x -> x > 0.1, occk)  # occupied
-            isempty(occ_idx) && continue
-            psi_occ = psi[ik][:, occ_idx]
-            n_occ = length(occ_idx)
-
-            # Build rhs for each occupied band: deltaV * psi_n
-            # deltaV = e^{iq·r}, in real space multiply
-            for (ii, n) in enumerate(occ_idx)
-                fn = occk[n]
-                psi_n_G = psi[ik][:, n]
-                psi_n_r = build_psi_r(basis, kpt, psi_n_G)
-                # rhs_r = e^{iq·r} * psi_n(r)
-                rhs_r = phase_q .* psi_n_r
-                # Convert rhs_r back to G space: need G_to_r inverse is r_to_G
-                # For simplicity, we compute rhs_G via FFT: r_to_G
-                # Place rhs_r on grid, FFT to get G coefficients, then project onto kpt basis
-                # Use FFTW.fft
-                rhs_grid = FFTW.fft(rhs_r) / sqrt(prod(fft_size))  # inverse of earlier ifft scaling
-                # Now extract G components corresponding to kpt.G_vectors
-                rhs_G = zeros(ComplexF64, n_pw)
-                for (i,G) in enumerate(kpt.G_vectors)
-                    ix = mod(Int(G[1]), fft_size[1]) + 1
-                    iy = mod(Int(G[2]), fft_size[2]) + 1
-                    iz = mod(Int(G[3]), fft_size[3]) + 1
-                    rhs_G[i] = rhs_grid[ix, iy, iz]
+        chi0_mat = zeros(ComplexF64, nG_actual, nG_actual)
+        for (jGprime, Gprime) in enumerate(G_list)
+            phase_qGprime = phase_qG_list[jGprime]
+            delta_rho_r_Gprime = zeros(ComplexF64, fft_size...)
+            for data in kpoint_data
+                for (iocc, n) in enumerate(data.occ_idx)
+                    fn = data.occk[n]
+                    psi_n_r = data.psi_occ_r[iocc]
+                    rhs_r = phase_qGprime .* psi_n_r
+                    rhs_G = build_psi_G(basis, data.kpt, rhs_r)
+                    x = solve_dynamic_gmres(data.Hk, data.psi_occ, data.epsk[n], rhs_G, z)
+                    delta_psi_r = build_psi_r(basis, data.kpt, x)
+                    delta_rho_r_Gprime .+= data.wk * fn .* conj.(psi_n_r) .* delta_psi_r
                 end
-                # Normalize rhs_G to match psi normalization
-                # The FFT scaling we used should make ∫|psi|^2=1, so rhs_G should be similarly scaled
-                # Solve Sternheimer
-                eps_n = epsk[n]
-                x = solve_dynamic_dense(Hk, psi_occ, eps_n, rhs_G, z)
-                # x is delta_psi_G
-                # Convert delta_psi_G to real space
-                delta_psi_r = build_psi_r(basis, kpt, x)
-                # delta_rho contribution: f_n * psi_n^* * delta_psi
-                delta_rho_r .+= wk * fn * conj.(psi_n_r) .* delta_psi_r
+            end
+            for (iG, G) in enumerate(G_list)
+                chi0_mat[iG, jGprime] =
+                    sum(phase_minus_qG_list[iG] .* delta_rho_r_Gprime) * dV / Omega
             end
         end
 
-        # chi0_00 = (1/Ω) ∫ e^{-iq·r} delta_rho(r) dr
-        chi0_00 = sum(phase_minus_q .* delta_rho_r) * dV / Omega
-        eps_00 = 1 - vc_q * chi0_00
-        epsM = eps_00  # head only, no local fields
-
-        push!(chi0_list, chi0_00)
-        push!(epsM_list, epsM)
-        @info "omega=$omega chi0_00=$chi0_00 epsM=$epsM"
+        epsilon_mat = Matrix{ComplexF64}(I, nG_actual, nG_actual) - vc * chi0_mat
+        epsilon_inv = inv(epsilon_mat)
+        push!(chi0_mat_list, chi0_mat)
+        push!(epsilon_mat_list, epsilon_mat)
+        push!(chi0_00, chi0_mat[1, 1])
+        push!(epsilon_M_LF, inv(epsilon_inv[1, 1]))
+        push!(epsilon_M_NLF, epsilon_mat[1, 1])
+        @info "omega=$omega chi0_00=$(chi0_mat[1, 1]) epsilon_M_LF=$(epsilon_M_LF[end]) epsilon_M_NLF=$(epsilon_M_NLF[end])"
     end
-
-    return (omegas=omegas, chi0=chi0_list, epsilon=epsM_list, vc=vc_q)
+    return (omegas=omegas, G_list=G_list, chi0_mat_list=chi0_mat_list,
+            epsilon_mat_list=epsilon_mat_list, epsilon_M_LF=epsilon_M_LF,
+            epsilon_M_NLF=epsilon_M_NLF, chi0_00=chi0_00, vc=vc)
 end
 
 end
@@ -1782,6 +2210,7 @@ Base.@kwdef struct SiSCFConfig
     kgrid::NTuple{3,Int} = (2, 2, 2)
     n_bands::Int = 30
     tol::Float64 = 1e-6
+    use_symmetries::Bool = true
 end
 
 function run_si_scf(cfg::SiSCFConfig=SiSCFConfig())
@@ -1802,7 +2231,9 @@ function run_si_scf(cfg::SiSCFConfig=SiSCFConfig())
         temperature=0.01,
         smearing=Smearing.Gaussian(),
     )
-
+    if !cfg.use_symmetries
+       model = Model(model; symmetries=false)
+    end
     basis = PlaneWaveBasis(
         model;
         Ecut=cfg.Ecut,
@@ -3569,6 +4000,242 @@ end
 
 
 
+===== FILE: test\test_fft_amplitude_preservation.jl =====
+
+using Test
+using LinearAlgebra
+using Random
+using DFTK
+
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "epsilon_macro_sternheimer.jl"))
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKDielectricMacroSternheimer
+
+@testset "fixed-amplitude PW/real transforms" begin
+    payload = scf_payload(run_si_scf())
+    basis = payload.basis
+    kpt = basis.kpoints[1]
+    c = ComplexF64.(payload.psi[1][:, 1])
+    N = prod(basis.fft_size)
+    Omega = abs(det(basis.model.lattice))
+    dV = Omega / N
+
+    psi_r = build_psi_r(basis, kpt, c)
+    @test sum(abs2, psi_r) * dV ≈ sum(abs2, c) rtol=2e-12 atol=2e-12
+    @test sum(abs2, psi_r) * dV ≈ 1 rtol=2e-12 atol=2e-12
+    @test build_psi_G(basis, kpt, psi_r) ≈ c rtol=2e-12 atol=2e-12
+    @test coefficients_to_real(basis, kpt, c) ≈ psi_r rtol=2e-12 atol=2e-12
+    @test real_to_coefficients(basis, kpt, psi_r) ≈ c rtol=2e-12 atol=2e-12
+
+    Random.seed!(20261031)
+    x = randn(ComplexF64, length(c))
+    alpha = 0.037 - 0.021im
+    x_r = coefficients_to_real(basis, kpt, x)
+    alpha_x_r = coefficients_to_real(basis, kpt, alpha .* x)
+
+    # This is the regression that fails if each delta_psi is normalized to norm 1.
+    @test alpha_x_r ≈ alpha .* x_r rtol=2e-12 atol=2e-12
+    @test sqrt(sum(abs2, x_r) * dV) ≈ norm(x) rtol=2e-12 atol=2e-12
+    @test sqrt(sum(abs2, alpha_x_r) * dV) ≈ abs(alpha) * norm(x) rtol=2e-12 atol=2e-12
+end
+
+
+
+
+===== FILE: test\test_kplusq_q_convergence.jl =====
+
+using Test
+using Printf
+using Dates
+using ShiftSchur
+
+include(joinpath(@__DIR__, "..", "src", "dftk", "si_scf.jl"))
+include(joinpath(@__DIR__, "..", "src", "dftk", "epsilon_kplusq_bothbranches.jl"))
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKDielectricKplusQ
+
+"""
+Run the static, mesh-compatible q sequence q=(1/Nx,0,0).
+
+The default sequence is intentionally small enough for a desktop CPU:
+    (2,2,2) -> q=1/2
+    (4,2,2) -> q=1/4
+
+Set ENV["SHIFTSCHUR_QCONV_HEAVY"]="true" to append:
+    (4,4,4) -> q=1/4
+    (6,4,4) -> q=1/6
+
+This is a finite-q convergence diagnostic, not yet a production q->0
+extrapolation. Every calculation uses the full unreduced k mesh.
+"""
+function q_convergence_cases()
+    cases = [
+        (kgrid=(2, 2, 2), q_red=[0.5, 0.0, 0.0]),
+        (kgrid=(4, 2, 2), q_red=[0.25, 0.0, 0.0]),
+    ]
+    if lowercase(get(ENV, "SHIFTSCHUR_QCONV_HEAVY", "false")) in ("1", "true", "yes")
+        append!(cases, [
+            (kgrid=(4, 4, 4), q_red=[0.25, 0.0, 0.0]),
+            (kgrid=(6, 4, 4), q_red=[1 / 6, 0.0, 0.0]),
+        ])
+    end
+    cases
+end
+
+@testset "mesh-compatible finite-q convergence" begin
+    eta = 0.05
+    omega = 0.0
+    n_bands = 30
+    nempty = 26
+    rows = NamedTuple[]
+
+    for case in q_convergence_cases()
+        kgrid = case.kgrid
+        q_red = case.q_red
+        println("\n=== q-convergence case: kgrid=$kgrid q_red=$q_red ===")
+
+        t0 = time_ns()
+        scfres = run_si_scf(SiSCFConfig(
+            kgrid=kgrid,
+            n_bands=n_bands,
+            use_symmetries=false,
+        ))
+        scf_seconds = (time_ns() - t0) / 1e9
+
+        nk_expected = prod(kgrid)
+        @test length(scfres.basis.kpoints) == nk_expected
+        @test all(isapprox(w, 1 / nk_expected; atol=1e-14, rtol=1e-12)
+                  for w in scfres.basis.kweights)
+
+        mapping = build_kplusq_map(scfres.basis, q_red)
+        @test length(mapping) == nk_expected
+        @test all(entry -> entry.target in eachindex(scfres.basis.kpoints), mapping)
+        @test length(unique(entry.target for entry in mapping)) == nk_expected
+
+        t1 = time_ns()
+        result = compare_kplusq_sternheimer_sos(
+            scfres,
+            [omega];
+            eta=eta,
+            q_red=q_red,
+            nempty=nempty,
+        )
+        response_seconds = (time_ns() - t1) / 1e9
+
+        eps_stern = only(result.epsilon_sternheimer)
+        eps_sos = only(result.epsilon_sos)
+        chi_stern = only(result.chi_sternheimer)
+        chi_sos = only(result.chi_sos)
+        rel_chi = only(result.relative_chi_error)
+
+        @test isfinite(real(eps_stern)) && isfinite(imag(eps_stern))
+        @test isfinite(real(eps_sos)) && isfinite(imag(eps_sos))
+        @test abs(imag(eps_stern)) < 1e-12
+        @test abs(imag(eps_sos)) < 1e-12
+        @test rel_chi < 0.25
+
+        push!(rows, (
+            kgrid=kgrid,
+            nk=nk_expected,
+            qx=q_red[1],
+            qnorm=sqrt(4pi / result.vc),
+            epsilon_sternheimer=eps_stern,
+            epsilon_sos=eps_sos,
+            chi_sternheimer=chi_stern,
+            chi_sos=chi_sos,
+            relative_chi_error=rel_chi,
+            scf_seconds=scf_seconds,
+            response_seconds=response_seconds,
+        ))
+    end
+
+    @test all(rows[i + 1].qx <= rows[i].qx for i in 1:length(rows)-1)
+
+    println("\nkgrid       nk      qx       |q|       Re eps(St)  Re eps(SoS) rel chi   SCF[s]  response[s]")
+    for row in rows
+        @printf("(%d,%d,%d) %5d  %7.4f  %8.5f  %11.7f  %11.7f  %.3e  %7.2f  %10.2f\n",
+                row.kgrid..., row.nk, row.qx, row.qnorm,
+                real(row.epsilon_sternheimer), real(row.epsilon_sos),
+                row.relative_chi_error, row.scf_seconds, row.response_seconds)
+    end
+
+    output = joinpath(@__DIR__, "..", "docs", "kplusq_q_convergence.csv")
+    mkpath(dirname(output))
+    open(output, "w") do io
+        println(io, "timestamp,kx,ky,kz,nk,qx,qnorm,Re_chi_stern,Im_chi_stern,Re_chi_sos,Im_chi_sos,Re_eps_stern,Im_eps_stern,Re_eps_sos,Im_eps_sos,rel_chi_err,scf_seconds,response_seconds")
+        stamp = Dates.format(now(), dateformat"yyyy-mm-ddTHH:MM:SS")
+        for row in rows
+            println(io, join((
+                stamp, row.kgrid[1], row.kgrid[2], row.kgrid[3], row.nk,
+                row.qx, row.qnorm,
+                real(row.chi_sternheimer), imag(row.chi_sternheimer),
+                real(row.chi_sos), imag(row.chi_sos),
+                real(row.epsilon_sternheimer), imag(row.epsilon_sternheimer),
+                real(row.epsilon_sos), imag(row.epsilon_sos),
+                row.relative_chi_error, row.scf_seconds, row.response_seconds,
+            ), ','))
+        end
+    end
+    println("Saved $output")
+
+    # Do not assert monotonic epsilon(q): anisotropic k meshes and finite-size
+    # quadrature can make the first few points non-monotonic. The CSV is the
+    # convergence diagnostic; strict extrapolation belongs to a denser sequence.
+end
+
+
+
+
+===== FILE: test\test_kplusq_sternheimer_sos.jl =====
+
+using Test
+using Printf
+using ShiftSchur
+include(joinpath(@__DIR__,"..","src","dftk","si_scf.jl"))
+include(joinpath(@__DIR__,"..","src","dftk","epsilon_kplusq_bothbranches.jl"))
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKDielectricKplusQ
+
+@testset "mesh-compatible k->k+q Sternheimer versus SoS" begin
+    # q=(1/2,0,0) is compatible with a full 2x2x2 mesh. The SCF helper must
+    # retain the full mesh (disable symmetry reduction if it currently does not).
+    scfres = run_si_scf(
+    SiSCFConfig(
+        n_bands=30,
+        use_symmetries=false,
+    ),
+)
+@test length(scfres.basis.kpoints) == 8
+
+println("full-mesh k points:")
+for (ik, kpt) in enumerate(scfres.basis.kpoints)
+    println(
+        "  k[$ik] = ",
+        collect(kpt.coordinate),
+        " weight=",
+        scfres.basis.kweights[ik],
+    )
+end    
+    q=[0.5,0.0,0.0]; omegas=[0.0,0.1,0.2]
+    mapping=build_kplusq_map(scfres.basis,q)
+    @test length(mapping)==length(scfres.basis.kpoints)
+    @test all(e->e.target in eachindex(scfres.basis.kpoints),mapping)
+    result=compare_kplusq_sternheimer_sos(scfres,omegas;eta=0.05,q_red=q,nempty=26)
+    println("omega Re eps(St) Im eps(St) Re eps(SoS) Im eps(SoS) rel chi")
+    for i in eachindex(omegas)
+        a=result.epsilon_sternheimer[i]; b=result.epsilon_sos[i]
+        @printf("%.2f %.8f %.8f %.8f %.8f %.3e\n",omegas[i],real(a),imag(a),real(b),imag(b),result.relative_chi_error[i])
+    end
+    @test all(isfinite,real.(result.epsilon_sternheimer))
+    @test all(isfinite,imag.(result.epsilon_sternheimer))
+    @test abs(imag(result.epsilon_sternheimer[1]))<1e-12
+    @test maximum(result.relative_chi_error)<0.25
+end
+
+
+
+
 ===== FILE: test\test_multishift_41.jl =====
 
 using Test
@@ -3871,6 +4538,51 @@ using Test
  else
    @test_skip "Wire silicon_response_fixture() to the existing Si fixture"
  end
+end
+
+
+
+
+===== FILE: test\test_sos_band_convergence.jl =====
+
+using Test
+using Printf
+using ShiftSchur
+include(joinpath(@__DIR__,"..","src","dftk","si_scf.jl"))
+include(joinpath(@__DIR__,"..","src","dftk","epsilon_macro_bothbranches.jl"))
+using .ShiftSchurDFTKSiSCF
+using .ShiftSchurDFTKDielectricMacroBothBranches
+
+@testset "Si SoS empty-band convergence against both-branch Sternheimer" begin
+    cfg=SiSCFConfig(n_bands=30)
+    scfres=run_si_scf(cfg)
+    omegas=[0.0,0.1,0.2,0.3,0.4]
+    result=sos_band_convergence(scfres,omegas;eta=0.05,q_red=[0.01,0.0,0.0],nempty_list=[2,4,8,12,16,22,26])
+
+    println("\nnempty  Re eps(0)  max rel chi  max rel eps")
+    for row in result.rows
+        @printf("%6d  %9.6f  %11.3e  %11.3e\n",row.nempty,real(row.static_epsilon),row.max_relative_chi_error,row.max_relative_epsilon_error)
+    end
+
+    output=joinpath(@__DIR__,"..","docs","sos_band_convergence.csv")
+    open(output,"w") do io
+        println(io,"nempty,omega,Re_chi_sos,Im_chi_sos,Re_eps_sos,Im_eps_sos,Re_chi_stern,Im_chi_stern,Re_eps_stern,Im_eps_stern,rel_chi_err,rel_eps_err")
+        for row in result.rows, i in eachindex(result.omegas)
+            cs=row.chi_sos[i]; es=row.epsilon_sos[i]
+            ct=result.chi_sternheimer[i]; et=result.epsilon_sternheimer[i]
+            erc=abs(cs-ct)/max(abs(ct),eps(Float64)); ere=abs(es-et)/max(abs(et),eps(Float64))
+            println(io,"$(row.nempty),$(result.omegas[i]),$(real(cs)),$(imag(cs)),$(real(es)),$(imag(es)),$(real(ct)),$(imag(ct)),$(real(et)),$(imag(et)),$erc,$ere")
+        end
+    end
+
+    @test length(result.rows)>=2
+    @test all(isfinite(row.max_relative_chi_error) for row in result.rows)
+    @test all(isfinite(row.max_relative_epsilon_error) for row in result.rows)
+    # Robust convergence criterion: the largest band set must improve over the smallest.
+    @test result.rows[end].max_relative_chi_error < result.rows[1].max_relative_chi_error
+    @test result.rows[end].max_relative_epsilon_error < result.rows[1].max_relative_epsilon_error
+    @test abs(imag(result.rows[end].static_epsilon)) < 1e-12
+    println("Saved $output")
 end
 
 
